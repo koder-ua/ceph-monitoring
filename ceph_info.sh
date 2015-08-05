@@ -1,5 +1,5 @@
 #!/bin/bash
-# set -x
+#set -x
 set -e
 set -o pipefail
 
@@ -25,10 +25,19 @@ function join() {
 
 function test_node_ready() {
     node="$1"
+    io_file="$2"
+
     for name in iostat screen ceph ; do
         set +e
         which_util=$(ssh $SSH_OPTS "$node" which "$name")
+        found_file=$(ssh $SSH_OPTS ls "$io_file")
         set -e
+
+        if [ -n "$found_file" ] ; then
+            echo "File $io_file already exists on $node. Loop found. Exiting"
+            exit 1
+        fi
+
         if [ -z "$which_util" ] ; then
             echo "No $name utility found on node $node. Exiting"
             exit 1
@@ -151,27 +160,43 @@ function get_osd_hosts() {
 function run_me_in_screen() {
     script_path="$1"
     host="$2"
-    mtime="$3"
+    execution_id="$3"
+    mtime="$4"
 
     script_basename=$(basename "$script_path")
     target="/tmp/$script_basename"
     scp $SSH_OPTS "$script_path" "$host:$target" >/dev/null
-    ssh $SSH_OPTS "$host" screen -S ceph_monitor -d -m bash "$target" --monitor $mtime
+    ssh $SSH_OPTS "$host" screen -S ceph_monitor -d -m bash "$target" --monitor "$execution_id" "$mtime"
 }
-
-MONITOR_FILE="/tmp/osd_mon"
 
 if [ "$1" == "--monitor" ] ; then
     # 
     # THIS EXECUTED ON MONITORED NODES
     #
-    monitor_ceph_io "$2" > "${MONITOR_FILE}.io" &
-    monitor_ceph_cpu "$2" > "${MONITOR_FILE}.cpu"
+    execution_id="$2"
+    runtime="$3"
+else
+    execution_id=$(uuidgen)
+    runtime="$1"
+fi
+
+
+MONITOR_DIR="/tmp"
+RESULT_DIR="/tmp"
+
+io_file="${MONITOR_DIR}/ceph_stats_io_${execution_id}.txt"
+cpu_file="${MONITOR_DIR}/ceph_stats_cpu_${execution_id}.txt"
+all_files="$io_file $cpu_file"
+
+
+if [ "$1" == "--monitor" ] ; then
+    monitor_ceph_io "$runtime" > "$io_file" &
+    monitor_ceph_cpu "$runtime" > "$cpu_file"
+    rm $0
 else
     # 
     # THIS EXECUTED ON MASTER NODE
     #
-
     hosts=$(get_osd_hosts)
 
     if [ -z "$hosts" ] ; then
@@ -179,21 +204,23 @@ else
         exit 1
     fi
 
-    # runtime - 3s
-    mtime=$1
-
     echo -n "Find ceph nodes: "
     echo $hosts | tr '\n' ' '
     echo
     echo "Start monitoring"
+
+    # test nodes ok
+    for host in $hosts ; do
+        test_node_ready "$host" "$io_file"
+    done
+
     # Start monitoting in BG
     for host in $hosts ; do
-        test_node_ready "$host"
-        run_me_in_screen "$0" "$host" $mtime
+        run_me_in_screen "$0" "$host" "$execution_id" "$runtime"
     done
 
     # Wait
-    (( stime=mtime+1 ))
+    (( stime=runtime+1 ))
     echo -n "Will sleep for $stime seconds till "
     date -d "+${stime} seconds" "+%H:%M:%S"
     sleep $stime
@@ -202,11 +229,16 @@ else
     files=""
     # Collect data
     for host in $hosts ; do
-        scp $SSH_OPTS "$host:${MONITOR_FILE}.io" "${MONITOR_FILE}.${host}.io" >/dev/null
-        scp $SSH_OPTS "$host:${MONITOR_FILE}.cpu" "${MONITOR_FILE}.${host}.cpu" >/dev/null
-        ssh $SSH_OPTS "$host" rm "${MONITOR_FILE}.io" "${MONITOR_FILE}.cpu" >/dev/null
-        files="$files ${MONITOR_FILE}.${host}.io ${MONITOR_FILE}.${host}.cpu"
+        for file in $all_files ; do
+            base_fname=$(basename ${file})
+            target="$RESULT_DIR/${host}_${base_fname}"
+            scp $SSH_OPTS "$host:$file" "$target" >/dev/null
+            files="$files $target"
+        done
+        ssh $SSH_OPTS "$host" rm "$all_files " >/dev/null
     done
-    echo -n "Done, results are stored in "
-    echo $files
+    res_file="$RESULT_DIR/ceph_stats_${execution_id}.tar.gz"
+    tar cvzf "$res_file" $files
+    rm $files
+    echo "Done, results are stored in $res_file"
 fi
