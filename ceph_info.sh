@@ -78,7 +78,8 @@ function get_osd_devices_old() {
 }
 
 DEV_CODE="import socket, json, sys;"
-DEV_CODE="${DEV_CODE}hostname = socket.gethostbyaddr(socket.gethostname())[1][0];"
+DEV_CODE="${DEV_CODE}hostdata = socket.gethostbyaddr(socket.gethostname());"
+DEV_CODE="${DEV_CODE}hostname = hostdata[1][0] if len(hostdata[1]) > 0 else hostdata[0];"
 DEV_CODE="${DEV_CODE}data = json.loads(sys.stdin.read());"
 DEV_CODE="${DEV_CODE}res = [' '.join(map(str, i['children'])) for i in data['nodes']"
 DEV_CODE="${DEV_CODE}                                         if i['name'] == hostname];"
