@@ -97,8 +97,8 @@ function get_root_dev() {
 
 function get_osd_devices_by_num() {
     osd_num="$1"
-    jpath=$(ceph --admin-daemon "/var/run/ceph/ceph-osd.${osd_num}.asok" config show | grep -E '\bosd_journal\b' | awk '{print $2}' | tr -d '\\",')
-    data=$(ceph --admin-daemon /var/run/ceph/ceph-osd.${osd_num}.asok config show | grep -E '\bosd_data\b'  | awk '{print $2}' | tr -d '\\",')
+    jpath=$(sudo ceph --admin-daemon "/var/run/ceph/ceph-osd.${osd_num}.asok" config show | grep -E '\bosd_journal\b' | awk '{print $2}' | tr -d '\\",')
+    data=$(sudo ceph --admin-daemon /var/run/ceph/ceph-osd.${osd_num}.asok config show | grep -E '\bosd_data\b'  | awk '{print $2}' | tr -d '\\",')
 
     get_root_dev $(get_dev $(follow_slink $jpath))
     get_root_dev $(get_dev $(follow_slink $data))
@@ -193,7 +193,6 @@ all_files="$io_file $cpu_file"
 if [ "$1" == "--monitor" ] ; then
     monitor_ceph_io "$runtime" > "$io_file" &
     monitor_ceph_cpu "$runtime" > "$cpu_file"
-    rm $0
 else
     # 
     # THIS EXECUTED ON MASTER NODE
@@ -239,7 +238,7 @@ else
         ssh $SSH_OPTS "$host" rm "$all_files " >/dev/null
     done
     res_file="$RESULT_DIR/ceph_stats_${execution_id}.tar.gz"
-    tar cvzf "$res_file" $files
+    tar cvzf "$res_file" $files >/dev/null
     rm $files
     echo "Done, results are stored in $res_file"
 fi
