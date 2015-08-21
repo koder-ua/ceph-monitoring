@@ -1,0 +1,7 @@
+To start the test for Ceph Cluster I/O perfomance  one should add test cases to multitest.sh by inserting something like
+do_test 10 15 2 3
+do_test 10 15 3 4
+
+and then invoke following command line:
+
+./multitest.sh "80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98 99" "12288 active+clean" | tee multi.log
