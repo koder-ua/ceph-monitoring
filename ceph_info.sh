@@ -6,11 +6,11 @@ set -o pipefail
 SSH_OPTS="-o LogLevel=quiet -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 
 function get_osd_pids() {
-    ps aux | grep ceph-osd | grep -v grep | awk '{print $2}'    
+    ps aux | grep -v grep | awk '/ceph-osd/{print $2}'    
 }
 
 function get_nic() {
-ifconfig | grep Ethernet | awk '{print $1}'
+    ifconfig | awk '/Ethernet/{print $1}'
 }
 
 
@@ -64,7 +64,7 @@ function get_osd_nodes() {
 
 
 function get_osd_nodes_old() {
-    ceph osd tree | grep -E '\bhost\b' | awk '{print $4}'   
+    ceph osd tree | awk '$3=="host" {print $4}'   
 }
 
 function get_dev() {
@@ -138,7 +138,13 @@ function uniq() {
 
 function monitor_ceph_io() {
     runtime="$1"
-    devs=$(get_osd_devices)
+
+    if [ -z "$2" ] ; then
+        devs=$(get_osd_devices)
+    else
+        devs="$2"
+    fi
+
     uniq_dev=$(uniq "$devs")
     grp=$(grep_rr $uniq_dev)
 
@@ -149,18 +155,20 @@ function monitor_ceph_io() {
 
 function monitor_ceph_io_sum() {
     runtime="$1"
-    devs=$(get_osd_devices)
+
+    if [ -z "$2" ] ; then
+        devs=$(get_osd_devices)
+    else
+        devs="$2"
+    fi
+
     uniq_dev=$(uniq "$devs")
     grp=$(grep_rr $uniq_dev)
 
-    #echo $uniq_dev
-
     for i in $(seq "$runtime") ; do
-        iostat -g testgroup { $uniq_dev } # | grep testgroup | awk '{print $5, $6}'
+        iostat -g testgroup { $uniq_dev }
         sleep 1
     done
-    #iostat -g testgroup { $uniq_dev } 1 $runtime #| grep testgroup
-    #iostat -g testgroup { $uniq_dev } #| grep testgroup
 }
 
 function monitor_ceph_cpu() {
@@ -179,11 +187,8 @@ function monitor_ceph_net() {
     runtime="$1"
 
     nic=$(get_nic)
-    #echo $nic
     for i in $(seq "$runtime") ; do
         ifconfig $nic | grep bytes | awk -F":| +" '{print $4, $9}'
-        #ifconfig $nic | grep "bytes"
-        #echo 
         sleep 1
     done
 }
@@ -228,8 +233,9 @@ all_files="$io_file $cpu_file $net_file $io_sum_file"
 
 
 if [ "$1" == "--monitor" ] ; then
-    monitor_ceph_io "$runtime" > "$io_file" &
-    monitor_ceph_io_sum "$runtime" > "$io_sum_file" &
+    devs=$(get_osd_devices)    
+    monitor_ceph_io "$runtime" "$devs" > "$io_file" &
+    monitor_ceph_io_sum "$runtime" "$devs" > "$io_sum_file" &
     monitor_ceph_cpu "$runtime" > "$cpu_file" &
     monitor_ceph_net "$runtime" > "$net_file"
 else
@@ -280,18 +286,17 @@ else
     tar cvzf "$res_file" $files >/dev/null
 
     files_io=$(ls $RESULT_DIR/*ceph_stats_io2_${execution_id}.txt)
-    #echo $files
+
     echo "IO: Read MB/ Write MB"
     for i in $files_io; do
-       cat $i | grep testgroup | awk '{print $5, $6}' | awk -f $MYDIR/sum.awk -v divisor=1024 -v name_offs=6
-       #awk -f sum.awk -v divisor=1024 -v name_offs=6 $i
+       cat $i | grep testgroup | awk '{print $5, $6}' | awk -f sum.awk -v divisor=1024 -v name_offs=6
     done
 
     files_net=$(ls $RESULT_DIR/*ceph_stats_net_${execution_id}.txt)
     #echo $files
     echo "Net: RX MB/ TX MB"
     for i in $files_net; do
-        awk -f $MYDIR/sum.awk -v divisor=1048576 -v name_offs=6 $i 
+        awk -f sum.awk -v divisor=1048576 -v name_offs=6 $i 
     done
 
     rm $files
