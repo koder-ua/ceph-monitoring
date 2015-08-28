@@ -1,7 +1,10 @@
 import sys
 import json
+import shutil
 import os.path
+import warnings
 import texttable
+import subprocess
 import collections
 
 import html
@@ -78,22 +81,69 @@ class Report(object):
         )
 
 
+class OSDStatus(object):
+    pass
+
+
 class ClusterData(object):
     def __init__(self, folder):
-        self.__folder = folder
+        self._folder = folder
+        self._osd_info = None
+        self._files = {}
+
+    def __iter__(self):
+        self._fill_osd_info()
+        return iter(self._osd_info.values())
+
+    def __getitem__(self, osd_num):
+        self._fill_osd_info()
+        return self._osd_info[osd_num]
+
+    def __len__(self):
+        self._fill_osd_info()
+        return len(self._osd_info)
 
     def __getattr__(self, name):
         try:
-            fname = os.path.join(self.__folder, name) + ".json"
+            fname = os.path.join(self._folder, "master", name) + ".json"
             val = json.loads(open(fname).read())
         except Exception as exc:
             raise AttributeError(str(exc))
         setattr(self, name, val)
         return val
 
+    def _fill_osd_info(self):
+        if self._osd_info is not None:
+            return
+
+        self._osd_info = {}
+        id2hosts = {}
+
+        for node in self.osd_tree['nodes']:
+            if node['type'] == "host":
+                for child_id in node['children']:
+                    id2hosts[child_id] = node['name']
+
+        for node in self.osd_tree['nodes']:
+            if node['type'] == "osd":
+                stat = OSDStatus()
+                stat.node = id2hosts[node['id']]
+                stat.id = node['id']
+                stat.status = node['status']
+                self._osd_info[stat.id] = stat
+
+        for osd_folder in os.listdir(self._folder):
+            if osd_folder.startswith('osd-'):
+                cfg_file = os.path.join(self._folder, osd_folder, "config.json")
+                data = json.loads(open(cfg_file).read())
+                osd_id = int(osd_folder.split('-')[1])
+                self._osd_info[osd_id].__dict__.update(data)
+
+        return
+
 
 def calc_osd_pool_PG_distribution(cdata):
-    pool_id2name = dict((dt['poolnum'], dt['poolname']) for dt in cdata.lspools)
+    pool_id2name = dict((dt['poolnum'], dt['poolname']) for dt in cdata.osd_lspools)
 
     res = collections.defaultdict(lambda: collections.Counter())
     for pg in cdata.pg_dump['pg_stats']:
@@ -138,9 +188,84 @@ def show_osd_pool_PG_distribution_txt(cdata):
     return tab.draw()
 
 
+def show_summary(report, cdata):
+    res = ["Status: " + cdata.s['health']['overall_status']]
+    res.append("PG count: " + str(cdata.s['pgmap']['num_pgs']))
+    res.append("Pool count: " + str(len(cdata.osd_lspools)))
+    osd_count = len(cdata)
+    res.append("OSD count: " + str(osd_count))
+    res.append("PG per OSD: " + str(cdata.s['pgmap']['num_pgs'] / osd_count))
+    res.append("Mon count: " + str(len(cdata.mon_status['monmap']['mons'])))
+    report.divs.append("<br>\n".join(res) + "<br>\n")
+
+
+def show_osd_devices_free_space(report, cdata):
+    table = html.Table(header_row=["OSD", "status", "used GB", "free GB", "free %"])
+
+    for osd_stats in sorted(cdata, key=lambda x: x.id):
+        used = osd_stats.data_dev['used'] / 1024 ** 3
+        free = osd_stats.data_dev['avail'] / 1024 ** 3
+
+        free_perc = (osd_stats.data_dev['avail'] * 100) / \
+            (osd_stats.data_dev['used'] + osd_stats.data_dev['avail'])
+
+        if free_perc < 20:
+            color = "red"
+        elif free_perc < 40:
+            color = "yellow"
+        else:
+            color = "green"
+
+        free_perc = '<font color="{0}">{1}</font>'.format(color, free_perc)
+        table.rows.append(map(str, [osd_stats.id, osd_stats.status, used, free, free_perc]))
+
+    report.divs.append("<center><H3>OSD devices:</H3><br>\n" + str(table) + "</center>")
+
+
+def show_pools_info(report, cdata):
+    table = html.Table(header_row=["Pool", "size", "min_size", "crush_ruleset", "pg_count"])
+
+    _, pools, _, sum_per_pool = calc_osd_pool_PG_distribution(cdata)
+
+    for pool_name, data in sorted(cdata.pool_stats.items()):
+        table.rows.append([pool_name,
+                           str(data['size']),
+                           str(data['min_size']),
+                           str(data['crush_ruleset']),
+                           str(sum_per_pool[pools.index(pool_name)])])
+
+    report.divs.append("<center><H3>Pool stats:</H3><br>\n" + str(table) + "</center>")
+
+
+def show_pg_state(report, cdata):
+    statuses = collections.defaultdict(lambda: 0)
+    for pg_group in cdata.s['pgmap']['pgs_by_state']:
+        for state_name in pg_group['state_name'].split('+'):
+            statuses[state_name] += pg_group["count"]
+
+    keys, values = zip(*sorted(statuses.items()))
+    table = html.Table(header_row=["sum"] + list(keys))
+    table.rows.append([cdata.s['pgmap']['num_pgs']] + list(values))
+    report.divs.append("<center><H3>PG status:</H3><br>\n" + str(table) + "</center>")
+
+
+def show_osd_state(report, cdata):
+    statuses = collections.defaultdict(lambda: [])
+
+    for osd_stat in cdata:
+        statuses[osd_stat.status].append(
+            "{0.node}:{0.id}".format(osd_stat))
+
+    table = html.Table(header_row=["Status", "Count", "ID's"])
+    for status, nodes in sorted(statuses.items()):
+        table.rows.append([status, len(nodes),
+                           "" if status == "up" else ",".join(nodes)])
+    report.divs.append("<center><H3>OSD state:</H3><br>\n" + str(table) + "</center>")
+
+
 def show_osd_pool_PG_distribution_html(report, cdata):
     data, cols, sum_per_osd, sum_per_pool = calc_osd_pool_PG_distribution(cdata)
-    table = html.Table(header_row=["OSD"] + map(str, cols) + ['sum'])
+    table = html.Table(header_row=["OSD/pool"] + map(str, cols) + ['sum'])
 
     for name, row in data.items():
         idata = [row.get(i, 0) for i in cols]
@@ -152,7 +277,7 @@ def show_osd_pool_PG_distribution_html(report, cdata):
                       map(str, sum_per_pool) +
                       [str(sum(sum_per_pool))])
 
-    report.divs.append(str(table))
+    report.divs.append("<center><H3>PG per OSD:</H3><br>" + str(table) + "</center>")
 
 
 visjs_script = """
@@ -278,20 +403,36 @@ def tree_to_sigma(cdata):
 def main(argv):
     folder = argv[1]
     name = argv[2]
+    remove_folder = False
+
     if os.path.isfile(folder):
-        # unpack
-        pass
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            arch_name = folder
+            folder = os.tempnam()
+            os.makedirs(folder)
+            remove_folder = True
+            subprocess.call("tar -zxvf {0} -C {1} >/dev/null 2>&1".format(arch_name, folder), shell=True)
 
     if not os.path.isdir(folder):
         print "First argument should be a folder with data or path to archive"
         return 1
 
-    cdata = ClusterData(folder)
-    report = Report(name)
-    # print show_osd_pool_PG_distribution(cdata)
-    show_osd_pool_PG_distribution_html(report, cdata)
-    tree_to_visjs(report, cdata)
-    print str(report)
+    try:
+        cdata = ClusterData(folder)
+        report = Report(name)
+        # print show_osd_pool_PG_distribution(cdata)
+        show_summary(report, cdata)
+        show_osd_pool_PG_distribution_html(report, cdata)
+        show_pools_info(report, cdata)
+        show_osd_devices_free_space(report, cdata)
+        show_pg_state(report, cdata)
+        show_osd_state(report, cdata)
+        tree_to_visjs(report, cdata)
+        print str(report)
+    finally:
+        if remove_folder:
+            shutil.rmtree(folder)
 
 
 if __name__ == "__main__":
