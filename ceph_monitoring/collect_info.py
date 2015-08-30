@@ -463,6 +463,6 @@ if __name__ == "__main__":
         exit(main(sys.argv))
     except:
         if logger_ready:
-            logger.exception()
+            logger.exception("During main")
         else:
             raise
