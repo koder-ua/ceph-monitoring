@@ -48,6 +48,29 @@ def check_output_ssh(host, opts, cmd):
     return check_output("ssh {2} {0} {1}".format(host, cmd, ssh_opts), False)
 
 
+def get_device_for_file(host, opts, fname):
+    ok, dev_str = check_output_ssh(host, opts, "df " + fname)
+    assert ok
+
+    dev_str = dev_str.strip()
+    dev_link = dev_str.strip().split("\n")[1].split()[0]
+
+    if dev_link == 'udev':
+        dev_link = fname
+
+    abs_path_cmd = '\'path="{0}" ;'.format(dev_link)
+    abs_path_cmd += 'while [ -h "$path" ] ; do path=$(readlink "$path") ;'
+    abs_path_cmd += ' path=$(readlink -f "$path") ; done ; echo $path\''
+    ok, dev = check_output_ssh(host, opts, abs_path_cmd)
+    assert ok
+
+    root_dev = dev = dev.strip()
+    while root_dev[-1].isdigit():
+        root_dev = root_dev[:-1]
+
+    return root_dev, dev
+
+
 class Collector(object):
     name = None
     run_alone = False
@@ -137,25 +160,12 @@ class CephDataCollector(Collector):
     def emit_device_info(self, host, path, device_file):
         ok, dev_str = check_output_ssh(host, self.opts, "df " + device_file)
         assert ok
+        dev_data = dev_str.strip().split("\n")[1].split()
 
-        dev_str = dev_str.strip()
-        dev_link = dev_str.strip().split("\n")[1].split()[0]
+        used = int(dev_data[2]) * 1024
+        avail = int(dev_data[3]) * 1024
 
-        if dev_link == 'udev':
-            dev_link = device_file
-
-        used = int(dev_str.strip().split("\n")[1].split()[2]) * 1024
-        avail = int(dev_str.strip().split("\n")[1].split()[3]) * 1024
-
-        abs_path_cmd = '\'path="{0}" ;'.format(dev_link)
-        abs_path_cmd += 'while [ -h "$path" ] ; do path=$(readlink "$path") ;'
-        abs_path_cmd += ' path=$(readlink -f "$path") ; done ; echo $path\''
-        ok, dev = check_output_ssh(host, self.opts, abs_path_cmd)
-        assert ok
-
-        root_dev = dev = dev.strip()
-        while root_dev[-1].isdigit():
-            root_dev = root_dev[:-1]
+        root_dev, dev = get_device_for_file(host, self.opts, device_file)
 
         cmd = "cat /sys/block/{0}/queue/rotational".format(os.path.basename(root_dev))
         ok, is_ssd_str = check_output_ssh(host, self.opts, cmd)
@@ -174,8 +184,10 @@ class CephDataCollector(Collector):
 
     def collect_osd(self, path, host, osd_id):
         path = "{0}/osd/{1}/".format(path, osd_id)
+
         osd_cfg_cmd = "sudo ceph -f json --admin-daemon /var/run/ceph/ceph-osd.{0}.asok config show"
         ok, data = check_output_ssh(host, self.opts, osd_cfg_cmd.format(osd_id))
+
         self.emit(path + "config", 'json', ok, data)
         assert ok
 
@@ -215,12 +227,35 @@ class NodeCollector(Collector):
             self.ssh2emit(host, path + path_off, frmt, cmd)
 
 
-class PerfCollector(Collector):
+class NodePerformanceCollector(Collector):
     name = 'performance'
     run_alone = True
 
     def collect_node(self, path, host):
         path = 'hosts/' + host + '/'
+        self.ssh2emit(host, path + "vmstat", "txt",
+                      "vmstat 1 {0}".format(self.opts.stat_collect_seconds))
+        self.ssh2emit(host, path + "iostat", "txt",
+                      "iostat -x 1 {0}".format(self.opts.stat_collect_seconds))
+        self.ssh2emit(host, path + "top", "txt",
+                      "top -b -d {0} -n 10".format(self.opts.stat_collect_seconds))
+
+
+class CephPerformanceCollector(Collector):
+    name = 'ceph_performance'
+    run_alone = True
+
+    def collect_osd(self, path, host, osd_id):
+        path = '{0}/osd/{1}/'.format(path, osd_id)
+
+        osd_cfg_cmd = "sudo ceph -f json --admin-daemon /var/run/ceph/ceph-osd.{0}.asok config show"
+        ok, data = check_output_ssh(host, self.opts, osd_cfg_cmd.format(osd_id))
+        assert ok
+        osd_cfg = json.loads(data)
+
+        j_root_dev, j_dev = get_device_for_file(host, self.opts, str(osd_cfg['osd_journal']))
+        d_root_dev, d_dev = get_device_for_file(host, self.opts, str(osd_cfg['osd_data']))
+
         self.ssh2emit(host, path + "vmstat", "txt",
                       "vmstat 1 {0}".format(self.opts.stat_collect_seconds))
         self.ssh2emit(host, path + "iostat", "txt",
@@ -344,6 +379,14 @@ def setup_loggers(default_level=logging.INFO, log_fname=None):
         logger.addHandler(fh)
 
 
+ALL_COLLECTORS = [
+    CephDataCollector,
+    NodeCollector,
+    NodePerformanceCollector,
+    CephPerformanceCollector
+]
+
+
 def parse_args(argv):
     p = argparse.ArgumentParser()
     p.add_argument("-c", "--conf",
@@ -363,12 +406,17 @@ def parse_args(argv):
                    default=64, type=int,
                    help="Worker pool size")
 
-    p.add_argument("-s", "--stat-collect-seconds",
-                   default=15, type=int, metavar="SEC",
-                   help="Collect stats from node for SEC seconds")
+    p.add_argument("-s", "--performance-collect-seconds",
+                   default=60, type=int, metavar="SEC",
+                   help="Collect performance stats for SEC seconds")
 
     p.add_argument("-d", "--disable", default=[],
                    nargs='*', help="Disable collect pattern")
+
+    p.add_argument("--collectors", default="ceph,node",
+                   help="Coma separated list of collectors" +
+                   "select from : " +
+                   ",".join(coll.name for coll in ALL_COLLECTORS))
 
     p.add_argument("-r", "--result", default=None, help="Result file")
 
@@ -410,10 +458,12 @@ def main(argv):
     collector_settings = CollectSettings()
     map(collector_settings.disable, opts.disable)
 
+    allowed_collectors = opts.collectors.split(',')
+
     collectors = [
-        CephDataCollector(opts, collector_settings, res_q),
-        NodeCollector(opts, collector_settings, res_q),
-        # PerfCollector(opts, collector_settings, res_q)
+        collector_class(opts, collector_settings, res_q)
+        for collector_class in ALL_COLLECTORS
+        if collector_class.name in allowed_collectors
     ]
 
     nodes = discover_nodes(opts)

@@ -310,26 +310,28 @@ def show_summary(report, jstorage):
     res.append(line.format("Free %", avail_perc))
 
     osd_count = len(jstorage.osd)
-    res.append(line.format("OSD count", osd_count))
-    res.append(line.format("PG per OSD", mstorage.status['pgmap']['num_pgs'] / osd_count))
     res.append(line.format("Mon count", len(mstorage.mon_status['monmap']['mons'])))
 
     report.divs.append(
-        '<center><table border="0" cellpadding="5">' +
+        '<center>Status:<br><table border="0" cellpadding="5">' +
         "\n".join(res) +
         "</table></center>")
 
     res = []
     osd0_stats = get_osds_info(jstorage)[0]
-    res.append(line.format("OSD Cluster net", osd0_stats.cluster_network))
-    res.append(line.format("OSD Public net", osd0_stats.public_network))
-    res.append(line.format("OSD near full ratio", osd0_stats.mon_osd_nearfull_ratio))
-    res.append(line.format("OSD full ratio", osd0_stats.mon_osd_full_ratio))
-    res.append(line.format("OSD journal aio", osd0_stats.journal_aio))
-    res.append(line.format("OSD journal dio", osd0_stats.journal_dio))
+    res.append(line.format("Count", osd_count))
+    res.append(line.format("PG per OSD", mstorage.status['pgmap']['num_pgs'] / osd_count))
+    res.append(line.format("Cluster net", osd0_stats.cluster_network))
+    res.append(line.format("Public net", osd0_stats.public_network))
+    res.append(line.format("Near full ratio", osd0_stats.mon_osd_nearfull_ratio))
+    res.append(line.format("Full ratio", osd0_stats.mon_osd_full_ratio))
+    res.append(line.format("Backfill full ratio", osd0_stats.osd_backfill_full_ratio))
+    res.append(line.format("Filesafe full ratio", osd0_stats.osd_failsafe_full_ratio))
+    res.append(line.format("Journal aio", osd0_stats.journal_aio))
+    res.append(line.format("Journal dio", osd0_stats.journal_dio))
 
     report.divs.append(
-        '<center><table border="0" cellpadding="5">' +
+        '<center>OSD:<table border="0" cellpadding="5">' +
         "\n".join(res) +
         "</table></center>")
 
@@ -378,9 +380,9 @@ def show_osd_info(report, jstorage, storage):
             daemon_msg = '<font color="orange">???</font>'
 
         if osd_stats.data_stor_stats['root_dev'] == osd_stats.j_stor_stats['root_dev']:
-            j_on_same_drive = html_ok("yes")
+            j_on_same_drive = html_fail("yes")
         else:
-            j_on_same_drive = html_fail("no")
+            j_on_same_drive = html_ok("no")
 
         if osd_stats.data_stor_stats['dev'] != osd_stats.j_stor_stats['dev']:
             j_on_file = html_ok("no")
