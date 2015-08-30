@@ -8,6 +8,7 @@ import logging
 import os.path
 import argparse
 import warnings
+import datetime
 import threading
 import subprocess
 import collections
@@ -122,9 +123,31 @@ class CephDataCollector(Collector):
     def collect_master(self, path=None, node=None):
         path = path + "/master/"
 
-        for cmd in ['osd tree', 'pg dump', 'df', 'auth list',
-                    'health', 'health detail', "mon_status",
-                    'status']:
+        curr_data = "{0}\n{1}\n{2}".format(
+            datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
+            time.time())
+
+        self.emit(path + "collected_at", 'txt', True, curr_data)
+
+        ok, status = check_output(self.ceph_cmd + "status")
+        self.emit(path + "status", 'json', ok, status)
+        assert ok
+
+        cmds = ['osd tree', 'df', 'auth list',
+                'health', 'health detail', 'mon_status']
+
+        if json.loads(status)['pgmap']['num_pgs'] > self.opts.max_pg_dump_count:
+            logger.warning(
+                ("pg dump skipped, as num_pg ({0}) > max_pg_dump_count ({1})." +
+                 " Use --max-pg-dump-count NUM option to change the limit").format(
+                    json.loads(status)['pgmap']['num_pgs'],
+                    self.opts.max_pg_dump_count
+                 ))
+        else:
+            cmds.append('pg dump')
+
+        for cmd in cmds:
             self.run2emit(path + cmd.replace(" ", "_"), 'json',
                           self.ceph_cmd + cmd)
 
@@ -139,7 +162,7 @@ class CephDataCollector(Collector):
         for pool in json.loads(lspools):
             pool_name = pool['poolname']
             pool_stats[pool_name] = {}
-            for stat in ['size', 'min_size', 'crush_ruleset']:
+            for stat in ['size', 'min_size', 'crush_ruleset', 'pg_num', 'pgp_num']:
                 ok, val = check_output(self.ceph_cmd + "osd pool get {0} {1}".format(pool_name, stat))
                 assert ok
                 pool_stats[pool_name][stat] = json.loads(val)[stat]
@@ -195,12 +218,30 @@ class CephDataCollector(Collector):
         self.emit_device_info(host, path + "journal", str(osd_cfg['osd_journal']))
         self.emit_device_info(host, path + "data", str(osd_cfg['osd_data']))
         self.ssh2emit(host, path + "osd_daemons", 'txt', "ps aux | grep ceph-osd")
+        self.ssh2emit(host, path + "log", 'txt',
+                      "tail -n {0} /var/log/ceph/ceph-osd.{1}.log".format(
+                        self.opts.ceph_log_max_lines,
+                        osd_id
+                      ))
 
     def collect_monitor(self, path, host, name):
         path = "{0}/mon/{1}/".format(path, host)
-        # osd_cfg_cmd = "sudo ceph -f json --admin-daemon /var/run/ceph/ceph-osd.{0}.asok config show"
-        # ok, data = self.ssh2emit(host, path + "config", 'json', osd_cfg_cmd.format(osd_id))
         self.ssh2emit(host, path + "mon_daemons", 'txt', "ps aux | grep ceph-mon")
+        self.ssh2emit(host, path + "mon_log", 'txt',
+                      "tail -n {0} /var/log/ceph/ceph-mon.{1}.log".format(
+                        self.opts.ceph_log_max_lines,
+                        name
+                      ))
+        self.ssh2emit(host, path + "ceph_log", 'txt',
+                      "tail -n {0} /var/log/ceph/ceph.log".format(
+                        self.opts.ceph_log_max_lines,
+                        name
+                      ))
+        self.ssh2emit(host, path + "ceph_audit", 'txt',
+                      "tail -n {0} /var/log/ceph/ceph.audit.log".format(
+                        self.opts.ceph_log_max_lines,
+                        name
+                      ))
 
 
 class NodeCollector(Collector):
@@ -324,13 +365,14 @@ def discover_nodes(opts):
         CephDiscovery
     ]
 
-    nodes = collections.defaultdict(lambda: {})
+    nodes = collections.defaultdict(
+        lambda: collections.defaultdict(lambda: []))
+
     for discover_cls in discovers:
         discover = discover_cls(opts)
         for role, node, args in discover.discover():
-            assert node not in nodes[role], "Duplicating node params"
-            nodes[role][node] = args
-            nodes['node'][node] = {}
+            nodes[role][node].append(args)
+            nodes['node'][node] = [{}]
     return nodes
 
 
@@ -413,10 +455,17 @@ def parse_args(argv):
     p.add_argument("-d", "--disable", default=[],
                    nargs='*', help="Disable collect pattern")
 
+    p.add_argument("--ceph-log-max-lines", default=1000,
+                   type=int, help="Max lines from osd/mon log")
+
     p.add_argument("--collectors", default="ceph,node",
                    help="Coma separated list of collectors" +
                    "select from : " +
                    ",".join(coll.name for coll in ALL_COLLECTORS))
+
+    p.add_argument("--max-pg-dump-count", default=2 ** 15,
+                   type=int,
+                   help="maximum PG count to by dumped with 'pg dump' cmd")
 
     p.add_argument("-r", "--result", default=None, help="Result file")
 
@@ -467,12 +516,14 @@ def main(argv):
     ]
 
     nodes = discover_nodes(opts)
-    nodes['master'][None] = {}
+    nodes['master'][None] = [{}]
 
     for role, nodes_with_args in nodes.items():
-        if role == 'node' or role == 'master':
+        if role == 'node':
             continue
         logger.info("Found %s hosts with role %s", len(nodes_with_args), role)
+        logger.info("Found %s services with role %s",
+                    sum(map(len, nodes_with_args.values())), role)
 
     logger.info("Found %s hosts total", len(nodes['node']))
 
@@ -480,8 +531,9 @@ def main(argv):
         for collector in collectors:
             if hasattr(collector, 'collect_' + role):
                 coll_func = getattr(collector, 'collect_' + role)
-                for node, kwargs in nodes_with_args.items():
-                    run_q.put((coll_func, "", node, kwargs))
+                for node, kwargs_list in nodes_with_args.items():
+                    for kwargs in kwargs_list:
+                        run_q.put((coll_func, "", node, kwargs))
 
     save_results_thread = threading.Thread(target=save_results_th_func,
                                            args=(opts, res_q, out_folder))

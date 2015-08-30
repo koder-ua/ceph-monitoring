@@ -276,7 +276,11 @@ def calc_osd_pool_PG_distribution(jstorage):
 
 
 def show_osd_pool_PG_distribution_txt(jstorage):
-    data, cols, sum_per_osd, sum_per_pool = calc_osd_pool_PG_distribution(jstorage)
+    try:
+        data, cols, sum_per_osd, sum_per_pool = calc_osd_pool_PG_distribution(jstorage)
+    except AttributeError:
+        return "No pg dump data. Probably too many PG"
+
     tab = texttable.Texttable(max_width=180)
     tab.set_deco(tab.HEADER | tab.VLINES | tab.BORDER)
     tab.set_cols_align(['l'] + ['r'] * (len(cols) + 1))
@@ -295,40 +299,54 @@ def show_osd_pool_PG_distribution_txt(jstorage):
     return tab.draw()
 
 
-def show_summary(report, jstorage):
+def show_summary(report, jstorage, storage):
     mstorage = jstorage.master
+
     line = '<tr><td>{0}:</td><td>{1}</td></tr>'
-    res = [line.format("Status", mstorage.status['health']['overall_status'])]
-    res.append(line.format("PG count", mstorage.status['pgmap']['num_pgs']))
-    res.append(line.format("Pool count", len(mstorage.osd_lspools)))
-    res.append(line.format("Used GB", mstorage.status['pgmap']["bytes_used"] / 1024 ** 3))
-    res.append(line.format("Avail GB", mstorage.status['pgmap']["bytes_avail"] / 1024 ** 3))
-    res.append(line.format("Data GB", mstorage.status['pgmap']["data_bytes"] / 1024 ** 3))
+
+    ok, frmt, data = storage['master/collected_at']
+    assert ok and frmt == 'txt'
+
+    res = []
+
+    def ap(x, y):
+        res.append(line.format(x, y))
+
+    local, gmt, _ = data.strip().split("\n")
+
+    ap("Collected at", local)
+    ap("Collected at GMT", gmt)
+    ap("Status", mstorage.status['health']['overall_status'])
+    ap("PG count", mstorage.status['pgmap']['num_pgs'])
+    ap("Pool count", len(mstorage.osd_lspools))
+    ap("Used GB", mstorage.status['pgmap']["bytes_used"] / 1024 ** 3)
+    ap("Avail GB", mstorage.status['pgmap']["bytes_avail"] / 1024 ** 3)
+    ap("Data GB", mstorage.status['pgmap']["data_bytes"] / 1024 ** 3)
 
     avail_perc = mstorage.status['pgmap']["bytes_avail"] * 100 / \
         mstorage.status['pgmap']['bytes_total']
-    res.append(line.format("Free %", avail_perc))
+    ap("Free %", avail_perc)
 
     osd_count = len(jstorage.osd)
-    res.append(line.format("Mon count", len(mstorage.mon_status['monmap']['mons'])))
+    ap("Mon count", len(mstorage.mon_status['monmap']['mons']))
 
     report.divs.append(
         '<center>Status:<br><table border="0" cellpadding="5">' +
         "\n".join(res) +
         "</table></center>")
 
-    res = []
+    del res[:]
     osd0_stats = get_osds_info(jstorage)[0]
-    res.append(line.format("Count", osd_count))
-    res.append(line.format("PG per OSD", mstorage.status['pgmap']['num_pgs'] / osd_count))
-    res.append(line.format("Cluster net", osd0_stats.cluster_network))
-    res.append(line.format("Public net", osd0_stats.public_network))
-    res.append(line.format("Near full ratio", osd0_stats.mon_osd_nearfull_ratio))
-    res.append(line.format("Full ratio", osd0_stats.mon_osd_full_ratio))
-    res.append(line.format("Backfill full ratio", osd0_stats.osd_backfill_full_ratio))
-    res.append(line.format("Filesafe full ratio", osd0_stats.osd_failsafe_full_ratio))
-    res.append(line.format("Journal aio", osd0_stats.journal_aio))
-    res.append(line.format("Journal dio", osd0_stats.journal_dio))
+    ap("Count", osd_count)
+    ap("PG per OSD", mstorage.status['pgmap']['num_pgs'] / osd_count)
+    ap("Cluster net", osd0_stats.cluster_network)
+    ap("Public net", osd0_stats.public_network)
+    ap("Near full ratio", osd0_stats.mon_osd_nearfull_ratio)
+    ap("Full ratio", osd0_stats.mon_osd_full_ratio)
+    ap("Backfill full ratio", osd0_stats.osd_backfill_full_ratio)
+    ap("Filesafe full ratio", osd0_stats.osd_failsafe_full_ratio)
+    ap("Journal aio", osd0_stats.journal_aio)
+    ap("Journal dio", osd0_stats.journal_dio)
 
     report.divs.append(
         '<center>OSD:<table border="0" cellpadding="5">' +
@@ -341,7 +359,11 @@ html_fail = '<font color="red">{0}</font>'.format
 
 
 def show_osd_info(report, jstorage, storage):
-    data, cols, sum_per_osd, sum_per_pool = calc_osd_pool_PG_distribution(jstorage)
+    try:
+        _, _, sum_per_osd, _ = calc_osd_pool_PG_distribution(jstorage)
+    except AttributeError:
+        sum_per_osd = None
+
     table = html.Table(header_row=["OSD",
                                    "node",
                                    "status",
@@ -408,7 +430,7 @@ def show_osd_info(report, jstorage, storage):
                  "%.3f<br>%.3f" % (
                     float(osd_stats.crush_weight),
                     float(osd_stats.reweight)),
-                 sum_per_osd[osd_stats.id],
+                 sum_per_osd[osd_stats.id] if sum_per_osd is not None else "No data",
                  used_b / 1024 ** 3,
                  avail_b / 1024 ** 3,
                  '<font color="{0}">{1}</font>'.format(color, avail_perc),
@@ -454,9 +476,8 @@ def show_pools_info(report, jstorage):
                                    "read<br>MB",
                                    "write<br>MB",
                                    "ruleset",
-                                   "PG"])
-
-    _, pools, _, sum_per_pool = calc_osd_pool_PG_distribution(jstorage)
+                                   "PG",
+                                   "PGP"])
 
     pool_stats = {}
     for pool in jstorage.master.rados_df['pools']:
@@ -467,15 +488,16 @@ def show_pools_info(report, jstorage):
         stat = pool_stats[pool_name]
         vals = [
             pool_name,
-            str(data['size']),
-            str(data['min_size']),
+            data['size'],
+            data['min_size'],
             int(stat["num_objects"]) / 1024,
             int(stat["size_bytes"]) / 1024 ** 2,
             '---',
             int(stat["read_bytes"]) / 1024 ** 2,
             int(stat["write_bytes"]) / 1024 ** 2,
-            str(data['crush_ruleset']),
-            str(sum_per_pool[pools.index(pool_name)])]
+            data['crush_ruleset'],
+            data["pg_num"],
+            data["pgp_num"]]
         table.rows.append(map(str, vals))
 
     report.divs.append("<center><H3>Pool's stats:</H3><br>\n" + str(table) + "</center>")
@@ -606,7 +628,12 @@ def show_hosts_stats(report, storage):
 
 
 def show_osd_pool_PG_distribution_html(report, jstorage):
-    data, cols, sum_per_osd, sum_per_pool = calc_osd_pool_PG_distribution(jstorage)
+    try:
+        data, cols, sum_per_osd, sum_per_pool = calc_osd_pool_PG_distribution(jstorage)
+    except AttributeError:
+        report.divs.append("<center><H3>PG per OSD: No pg dump data. Probably too many PG</H3></center>")
+        return
+
     table = html.Table(header_row=["OSD/pool"] + map(str, cols) + ['sum'])
 
     for name, row in sorted(data.items()):
@@ -672,13 +699,15 @@ def tree_to_visjs(report, jstorage):
         w = (float(node['crush_weight']) - min_w) / (max_w - min_w)
         return str(mcolors.rgb2hex(cmap(w)))
 
-    _, _, sum_per_osd, _ = calc_osd_pool_PG_distribution(jstorage)
-
-    min_pg = min(sum_per_osd.values())
-    max_pg = max(sum_per_osd.values())
+    try:
+        _, _, sum_per_osd, _ = calc_osd_pool_PG_distribution(jstorage)
+        min_pg = min(sum_per_osd.values())
+        max_pg = max(sum_per_osd.values())
+    except AttributeError:
+        min_pg = max_pg = sum_per_osd = None
 
     def get_color_pg_count(node):
-        if (max_w - min_w) / float(max_w) < 1E-2 or node['type'] != 'osd':
+        if (max_pg - min_pg) / float(max_pg) < 1E-2 or node['type'] != 'osd':
             return "#ffffff"
 
         w = (float(sum_per_osd[node['id']]) - min_pg) / (max_pg - min_pg)
@@ -720,14 +749,15 @@ def tree_to_visjs(report, jstorage):
     report.divs.append('<center>Crush weight:</center><br><div class="graph" id="mynetwork0"></div>')
     report.onload.append("draw0()")
 
-    gnodes, geges = get_graph(get_color_pg_count)
-    report.scripts.append(
-        visjs_script.replace('__nodes__', gnodes)
-                    .replace('__eges__', geges)
-                    .replace('__id__', '1')
-    )
-    report.divs.append('<center>PG\'s count:</center><br><div class="graph" id="mynetwork1"></div>')
-    report.onload.append("draw1()")
+    if sum_per_osd is not None:
+        gnodes, geges = get_graph(get_color_pg_count)
+        report.scripts.append(
+            visjs_script.replace('__nodes__', gnodes)
+                        .replace('__eges__', geges)
+                        .replace('__id__', '1')
+        )
+        report.divs.append('<center>PG\'s count:</center><br><div class="graph" id="mynetwork1"></div>')
+        report.onload.append("draw1()")
     report.next_line()
 
 
@@ -801,8 +831,10 @@ def main(argv):
     try:
         storage = RawResultStorage(folder)
         jstorage = JResultStorage(storage)
+
         report = Report(opts.report_name)
-        show_summary(report, jstorage)
+
+        show_summary(report, jstorage, storage)
         report.next_line()
 
         show_osd_pool_PG_distribution_html(report, jstorage)
