@@ -227,6 +227,7 @@ def get_osds_info(jstorage):
             stat.id = node['id']
             stat.status = node['status']
             stat.crush_weight = node['crush_weight']
+            stat.reweight = node['reweight']
             osds_info[stat.id] = stat
 
     for osd_id in jstorage.osd:
@@ -300,12 +301,25 @@ def show_summary(report, jstorage):
     res = [line.format("Status", mstorage.status['health']['overall_status'])]
     res.append(line.format("PG count", mstorage.status['pgmap']['num_pgs']))
     res.append(line.format("Pool count", len(mstorage.osd_lspools)))
+    res.append(line.format("Used GB", mstorage.status['pgmap']["bytes_used"] / 1024 ** 3))
+    res.append(line.format("Avail GB", mstorage.status['pgmap']["bytes_avail"] / 1024 ** 3))
+    res.append(line.format("Data GB", mstorage.status['pgmap']["data_bytes"] / 1024 ** 3))
+
+    avail_perc = mstorage.status['pgmap']["bytes_avail"] * 100 / \
+        mstorage.status['pgmap']['bytes_total']
+    res.append(line.format("Free %", avail_perc))
 
     osd_count = len(jstorage.osd)
     res.append(line.format("OSD count", osd_count))
     res.append(line.format("PG per OSD", mstorage.status['pgmap']['num_pgs'] / osd_count))
     res.append(line.format("Mon count", len(mstorage.mon_status['monmap']['mons'])))
 
+    report.divs.append(
+        '<center><table border="0" cellpadding="5">' +
+        "\n".join(res) +
+        "</table></center>")
+
+    res = []
     osd0_stats = get_osds_info(jstorage)[0]
     res.append(line.format("OSD Cluster net", osd0_stats.cluster_network))
     res.append(line.format("OSD Public net", osd0_stats.public_network))
@@ -320,16 +334,26 @@ def show_summary(report, jstorage):
         "</table></center>")
 
 
+html_ok = '<font color="green">{0}</font>'.format
+html_fail = '<font color="red">{0}</font>'.format
+
+
 def show_osd_info(report, jstorage, storage):
     data, cols, sum_per_osd, sum_per_pool = calc_osd_pool_PG_distribution(jstorage)
-    table = html.Table(header_row=["OSD", "node", "status", "daemon<br>run",
-                                   "weight", "PG count",
-                                   "used GB", "free GB", "free %",
-                                   "J on<br>diff disk",
-                                   "J on<br>SSD",
-                                   "J on<br>partition"])
+    table = html.Table(header_row=["OSD",
+                                   "node",
+                                   "status",
+                                   "daemon<br>run",
+                                   "weight<br>reweight",
+                                   "PG count",
+                                   "used GB",
+                                   "free GB",
+                                   "free %",
+                                   "Journal<br>on same<br>disk",
+                                   "Journal<br>on SSD",
+                                   "Journal<br>on file"])
 
-    for osd_stats in get_osds_info(jstorage):
+    for osd_stats in sorted(get_osds_info(jstorage), key=lambda x: x.id):
         used_b = osd_stats.data_stor_stats['used']
         avail_b = osd_stats.data_stor_stats['avail']
 
@@ -353,44 +377,82 @@ def show_osd_info(report, jstorage, storage):
         except KeyError:
             daemon_msg = '<font color="orange">???</font>'
 
-        if osd_stats.data_stor_stats['root_dev'] != osd_stats.j_stor_stats['root_dev']:
-            j_on_other_drive = '<font color="gree">yes</font>'
+        if osd_stats.data_stor_stats['root_dev'] == osd_stats.j_stor_stats['root_dev']:
+            j_on_same_drive = html_ok("yes")
         else:
-            j_on_other_drive = '<font color="red">no</font>'
+            j_on_same_drive = html_fail("no")
 
         if osd_stats.data_stor_stats['dev'] != osd_stats.j_stor_stats['dev']:
-            j_part = '<font color="gree">yes</font>'
+            j_on_file = html_ok("no")
         else:
-            j_part = '<font color="red">no</font>'
+            j_on_file = html_fail("yes")
 
         if osd_stats.j_stor_stats['is_ssd']:
-            j_on_ssd = '<font color="gree">yes</font>'
+            j_on_ssd = html_ok("yes")
         else:
-            j_on_ssd = '<font color="red">no</font>'
+            j_on_ssd = html_fail("no")
+
+        if osd_stats.status == 'up':
+            status = html_ok("up")
+        else:
+            status = html_fail("down")
 
         table.rows.append(
             map(str,
                 [osd_stats.id,
                  osd_stats.node,
-                 osd_stats.status,
+                 status,
                  daemon_msg,
-                 "%.3f" % (float(osd_stats.crush_weight),),
+                 "%.3f<br>%.3f" % (
+                    float(osd_stats.crush_weight),
+                    float(osd_stats.reweight)),
                  sum_per_osd[osd_stats.id],
                  used_b / 1024 ** 3,
                  avail_b / 1024 ** 3,
                  '<font color="{0}">{1}</font>'.format(color, avail_perc),
-                 j_on_other_drive,
+                 j_on_same_drive,
                  j_on_ssd,
-                 j_part]))
+                 j_on_file]))
 
-    report.divs.append("<center><H3>OSD info:</H3><br>\n" + str(table) + "</center>")
+    report.divs.append("<center><H3>OSD's info:</H3><br>\n" + str(table) + "</center>")
+
+
+def show_mons_info(report, jstorage):
+    table = html.Table(header_row=["Name",
+                                   "Node",
+                                   "Role",
+                                   "Disk free<br>MB (%)"])
+    srv_health = jstorage.master.status['health']['health']['health_services']
+    assert len(srv_health) == 1
+    for srv in srv_health[0]['mons']:
+
+        if srv["health"] == "HEALTH_OK":
+            health = html_ok("HEALTH_OK")
+        else:
+            health = html_fail(srv["health"])
+
+        line = [
+            srv["name"],
+            health,
+            "-",
+            "{0} ({1})".format(srv["kb_avail"] / 1024, srv["avail_percent"])
+        ]
+        table.rows.append(map(str, line))
+
+    report.divs.append("<center><H3>Monitors info:</H3><br>\n" + str(table) + "</center>")
 
 
 def show_pools_info(report, jstorage):
-    table = html.Table(header_row=["Pool", "size", "min_size",
-                                   "object<br>K", "data_size<br>MB", "free_size<br>MB",
-                                   "read<br>MB", "write<br>MB",
-                                   "ruleset", "PG"])
+    table = html.Table(header_row=["Pool",
+                                   "size",
+                                   "min_size",
+                                   "Kobj",
+                                   "data<br>MB",
+                                   "free<br>MB",
+                                   "read<br>MB",
+                                   "write<br>MB",
+                                   "ruleset",
+                                   "PG"])
 
     _, pools, _, sum_per_pool = calc_osd_pool_PG_distribution(jstorage)
 
@@ -406,15 +468,15 @@ def show_pools_info(report, jstorage):
             str(data['size']),
             str(data['min_size']),
             int(stat["num_objects"]) / 1024,
-            int(stat["size_kb"]) / 1024,
+            int(stat["size_bytes"]) / 1024 ** 2,
             '---',
-            int(stat["read_kb"]) / 1024,
-            int(stat["write_kb"]) / 1024,
+            int(stat["read_bytes"]) / 1024 ** 2,
+            int(stat["write_bytes"]) / 1024 ** 2,
             str(data['crush_ruleset']),
             str(sum_per_pool[pools.index(pool_name)])]
         table.rows.append(map(str, vals))
 
-    report.divs.append("<center><H3>Pool stats:</H3><br>\n" + str(table) + "</center>")
+    report.divs.append("<center><H3>Pool's stats:</H3><br>\n" + str(table) + "</center>")
 
 
 def show_pg_state(report, jstorage):
@@ -431,7 +493,7 @@ def show_pg_state(report, jstorage):
     for status, count in sorted(statuses.items()):
         table.rows.append([status, str(count), "%.2f" % (100.0 * count / npg)])
 
-    report.divs.append("<center><H3>PG status:</H3><br>\n" + str(table) + "</center>")
+    report.divs.append("<center><H3>PG's status:</H3><br>\n" + str(table) + "</center>")
 
 
 def show_osd_state(report, jstorage):
@@ -445,7 +507,7 @@ def show_osd_state(report, jstorage):
     for status, nodes in sorted(statuses.items()):
         table.rows.append([status, len(nodes),
                            "" if status == "up" else ",".join(nodes)])
-    report.divs.append("<center><H3>OSD state:</H3><br>\n" + str(table) + "</center>")
+    report.divs.append("<center><H3>OSD's state:</H3><br>\n" + str(table) + "</center>")
 
 
 def get_node_mem_info(node):
@@ -495,13 +557,13 @@ def get_node_load_5m(node):
 
 
 def show_hosts_stats(report, storage):
-    header_row = ["Hostname", "CPU count", "RAM total", "RAM free",
-                  "Swap used", "Net info", "Load avg, 5m"]
+    header_row = ["Hostname", "CPU's", "RAM<br>total", "RAM<br>free",
+                  "Swap<br>used", "Net info<br>Dev, speed, duplex<br>[IP addrs]", "Load avg<br>5 min"]
     table = html.Table(header_row=header_row)
     ok, _, hosts = storage.hosts
     assert ok
 
-    for host_name in hosts:
+    for host_name in sorted(hosts):
         node = getattr(hosts, host_name)[2]
         ok, frmt, lshw = node.lshw
         if not ok:
@@ -527,9 +589,9 @@ def show_hosts_stats(report, storage):
         if hw_info.net_info != {}:
             net_info = []
             for name, (speed, dtype, _) in hw_info.net_info.items():
-                net_info.append("{0}, {1}, duplex={2}".format(name, speed, dtype))
+                net_info.append("{0}, {1}, {2}".format(name, speed, dtype))
                 if name in ip_addr:
-                    net_info[-1] += "," + ",".join(ip_addr[name])
+                    net_info[-1] += "<br>" + ",".join(ip_addr[name])
             host_info.append("<br/>".join(net_info))
         else:
             host_info.append("Error")
@@ -538,14 +600,14 @@ def show_hosts_stats(report, storage):
 
         table.rows.append([host_name] + map(str, host_info))
 
-    report.divs.append("<center><H3>Host info:</H3><br>\n" + str(table) + "</center>")
+    report.divs.append("<center><H3>Host's info:</H3><br>\n" + str(table) + "</center>")
 
 
 def show_osd_pool_PG_distribution_html(report, jstorage):
     data, cols, sum_per_osd, sum_per_pool = calc_osd_pool_PG_distribution(jstorage)
     table = html.Table(header_row=["OSD/pool"] + map(str, cols) + ['sum'])
 
-    for name, row in data.items():
+    for name, row in sorted(data.items()):
         idata = [row.get(i, 0) for i in cols]
         table.rows.append([str(name)] +
                           map(str, idata) +
@@ -662,7 +724,7 @@ def tree_to_visjs(report, jstorage):
                     .replace('__eges__', geges)
                     .replace('__id__', '1')
     )
-    report.divs.append('<center>PG count:</center><br><div class="graph" id="mynetwork1"></div>')
+    report.divs.append('<center>PG\'s count:</center><br><div class="graph" id="mynetwork1"></div>')
     report.onload.append("draw1()")
     report.next_line()
 
@@ -751,6 +813,7 @@ def main(argv):
 
         show_osd_state(report, jstorage)
         show_hosts_stats(report, storage)
+        show_mons_info(report, jstorage)
         report.next_line()
 
         tree_to_visjs(report, jstorage)
