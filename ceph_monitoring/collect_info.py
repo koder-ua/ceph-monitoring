@@ -461,7 +461,7 @@ def main(argv):
 if __name__ == "__main__":
     try:
         exit(main(sys.argv))
-    except:
+    except Exception:
         if logger_ready:
             logger.exception("During main")
         else:
