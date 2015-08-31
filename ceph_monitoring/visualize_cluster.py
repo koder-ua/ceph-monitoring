@@ -484,20 +484,21 @@ def show_pools_info(report, jstorage):
         assert len(pool['categories']) == 1
         pool_stats[pool['name']] = pool['categories'][0]
 
-    for pool_name, data in sorted(jstorage.master.pool_stats.items()):
-        stat = pool_stats[pool_name]
+    for pool in sorted(jstorage.master.osd_dump['pools'],
+                       key=lambda pool: pool['pool_name']):
+        stat = pool_stats[pool['pool_name']]
         vals = [
-            pool_name,
-            data['size'],
-            data['min_size'],
+            pool['pool_name'],
+            pool['size'],
+            pool['min_size'],
             int(stat["num_objects"]) / 1024,
             int(stat["size_bytes"]) / 1024 ** 2,
             '---',
             int(stat["read_bytes"]) / 1024 ** 2,
             int(stat["write_bytes"]) / 1024 ** 2,
-            data['crush_ruleset'],
-            data["pg_num"],
-            data["pgp_num"]]
+            pool['crush_ruleset'],
+            pool["pg_num"],
+            pool["pg_placement_num"]]
         table.rows.append(map(str, vals))
 
     report.divs.append("<center><H3>Pool's stats:</H3><br>\n" + str(table) + "</center>")
@@ -691,10 +692,10 @@ def tree_to_visjs(report, jstorage):
                 for node in nodes
                 if node['type'] == 'osd')
 
-    cmap = plt.get_cmap('rainbow')
+    cmap = plt.get_cmap('rainbow') if plt is not None else None
 
     def get_color_w(node):
-        if max_w - min_w < 1E-2 or node['type'] != 'osd':
+        if max_w - min_w < 1E-2 or node['type'] != 'osd' or mcolors is None:
             return "#ffffff"
         w = (float(node['crush_weight']) - min_w) / (max_w - min_w)
         return str(mcolors.rgb2hex(cmap(w)))
@@ -707,7 +708,8 @@ def tree_to_visjs(report, jstorage):
         min_pg = max_pg = sum_per_osd = None
 
     def get_color_pg_count(node):
-        if (max_pg - min_pg) / float(max_pg) < 1E-2 or node['type'] != 'osd':
+        if (max_pg - min_pg) / float(max_pg) < 1E-2 or \
+           node['type'] != 'osd' or mcolors is None:
             return "#ffffff"
 
         w = (float(sum_per_osd[node['id']]) - min_pg) / (max_pg - min_pg)

@@ -134,8 +134,8 @@ class CephDataCollector(Collector):
         self.emit(path + "status", 'json', ok, status)
         assert ok
 
-        cmds = ['osd tree', 'df', 'auth list',
-                'health', 'health detail', 'mon_status']
+        cmds = ['osd tree', 'df', 'auth list', 'osd dump',
+                'health', 'health detail', 'mon_status', 'osd lspools']
 
         if json.loads(status)['pgmap']['num_pgs'] > self.opts.max_pg_dump_count:
             logger.warning(
@@ -153,21 +153,6 @@ class CephDataCollector(Collector):
 
         self.run2emit(path + "rados_df", 'json',
                       "rados df -c {0.conf} -k {0.key} --format json".format(self.opts))
-
-        ok, lspools = check_output(self.ceph_cmd + "osd lspools")
-        self.emit(path + "osd_lspools", 'json', ok, lspools)
-        assert ok
-
-        pool_stats = {}
-        for pool in json.loads(lspools):
-            pool_name = pool['poolname']
-            pool_stats[pool_name] = {}
-            for stat in ['size', 'min_size', 'crush_ruleset', 'pg_num', 'pgp_num']:
-                ok, val = check_output(self.ceph_cmd + "osd pool get {0} {1}".format(pool_name, stat))
-                assert ok
-                pool_stats[pool_name][stat] = json.loads(val)[stat]
-
-        self.emit(path + 'pool_stats', 'json', True, json.dumps(pool_stats))
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -282,27 +267,27 @@ class NodePerformanceCollector(Collector):
                       "top -b -d {0} -n 10".format(self.opts.stat_collect_seconds))
 
 
-class CephPerformanceCollector(Collector):
-    name = 'ceph_performance'
-    run_alone = True
+# class CephPerformanceCollector(Collector):
+#     name = 'ceph_performance'
+#     run_alone = True
 
-    def collect_osd(self, path, host, osd_id):
-        path = '{0}/osd/{1}/'.format(path, osd_id)
+#     def collect_osd(self, path, host, osd_id):
+#         path = '{0}/osd/{1}/'.format(path, osd_id)
 
-        osd_cfg_cmd = "sudo ceph -f json --admin-daemon /var/run/ceph/ceph-osd.{0}.asok config show"
-        ok, data = check_output_ssh(host, self.opts, osd_cfg_cmd.format(osd_id))
-        assert ok
-        osd_cfg = json.loads(data)
+#         osd_cfg_cmd = "sudo ceph -f json --admin-daemon /var/run/ceph/ceph-osd.{0}.asok config show"
+#         ok, data = check_output_ssh(host, self.opts, osd_cfg_cmd.format(osd_id))
+#         assert ok
+#         osd_cfg = json.loads(data)
 
-        j_root_dev, j_dev = get_device_for_file(host, self.opts, str(osd_cfg['osd_journal']))
-        d_root_dev, d_dev = get_device_for_file(host, self.opts, str(osd_cfg['osd_data']))
+#         j_root_dev, j_dev = get_device_for_file(host, self.opts, str(osd_cfg['osd_journal']))
+#         d_root_dev, d_dev = get_device_for_file(host, self.opts, str(osd_cfg['osd_data']))
 
-        self.ssh2emit(host, path + "vmstat", "txt",
-                      "vmstat 1 {0}".format(self.opts.stat_collect_seconds))
-        self.ssh2emit(host, path + "iostat", "txt",
-                      "iostat -x 1 {0}".format(self.opts.stat_collect_seconds))
-        self.ssh2emit(host, path + "top", "txt",
-                      "top -b -d {0} -n 10".format(self.opts.stat_collect_seconds))
+#         self.ssh2emit(host, path + "vmstat", "txt",
+#                       "vmstat 1 {0}".format(self.opts.stat_collect_seconds))
+#         self.ssh2emit(host, path + "iostat", "txt",
+#                       "iostat -x 1 {0}".format(self.opts.stat_collect_seconds))
+#         self.ssh2emit(host, path + "top", "txt",
+#                       "top -b -d {0} -n 10".format(self.opts.stat_collect_seconds))
 
 
 class CephDiscovery(object):
@@ -350,10 +335,10 @@ def save_results_th_func(opts, res_q, out_folder):
 
             if frmt == 'bin':
                 open(fname, "wb").write(out)
-            elif frmt == json:
+            elif frmt == 'json':
                 if not opts.no_pretty_json:
                     out = json.dumps(json.loads(out), indent=4, sort_keys=True)
-                open(fname, "wb").write(out)
+                open(fname, "w").write(out)
             else:
                 open(fname, "w").write(out)
     except:
@@ -425,7 +410,7 @@ ALL_COLLECTORS = [
     CephDataCollector,
     NodeCollector,
     NodePerformanceCollector,
-    CephPerformanceCollector
+    # CephPerformanceCollector
 ]
 
 
