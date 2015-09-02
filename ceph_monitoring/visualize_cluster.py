@@ -2,21 +2,16 @@ import re
 import sys
 import json
 import shutil
+import bisect
 import os.path
 import warnings
 import argparse
-import texttable
 import subprocess
 import collections
 
-import html
+from ipaddr import IPNetwork, IPAddress
 
-try:
-    import matplotlib.pyplot as plt
-    import matplotlib.colors as mcolors
-except ImportError:
-    plt = None
-    mcolors = None
+import html
 
 from hw_info import get_hw_info, b2ssize, ssize2b
 
@@ -162,6 +157,12 @@ class RawResultStorage(object):
             raise KeyError("Path not found")
         return data[rest]
 
+    def get(self, path, default=None, expected_format='txt'):
+        ok, frmt, data = self[path]
+        if not ok or frmt != expected_format:
+            return default
+        return data
+
     def __len__(self):
         return len(self._load())
 
@@ -236,67 +237,61 @@ def get_osds_info(jstorage):
         osd_obj = osds_info[int(osd_id)]
         osd_obj.data_stor_stats = josd_obj.data.stats
         osd_obj.j_stor_stats = josd_obj.journal.stats
-        osd_obj.__dict__.update(josd_obj.config)
 
-    jstorage._osd_info = osds_info.values()
+        try:
+            osd_obj.__dict__.update(josd_obj.config)
+        except AttributeError:
+            # osd is down, no config available
+            pass
+
+    jstorage._osd_info = list(osds_info.values())
     return jstorage._osd_info
 
 
-def calc_osd_pool_PG_distribution(jstorage):
+def osd_pool_PG_distribution(jstorage):
     try:
         return jstorage._pg_distr
     except AttributeError:
         pass
 
+    try:
+        pg_dump = jstorage.master.pg_dump
+    except AttributeError:
+        return None, None, None
+
     pool_id2name = dict((dt['poolnum'], dt['poolname'])
                         for dt in jstorage.master.osd_lspools)
 
-    res = collections.defaultdict(lambda: collections.Counter())
-    for pg in jstorage.master.pg_dump['pg_stats']:
+    osd_pool_pg_2d = collections.defaultdict(lambda: collections.Counter())
+    sum_per_pool = collections.Counter()
+    sum_per_osd = collections.Counter()
+
+    for pg in pg_dump['pg_stats']:
         pool = int(pg['pgid'].split('.', 1)[0])
         for osd_num in pg['acting']:
-            res[osd_num][pool_id2name[pool]] += 1
+            pool_name = pool_id2name[pool]
+            osd_pool_pg_2d[osd_num][pool_name] += 1
+            sum_per_pool[pool_name] += 1
+            sum_per_osd[osd_num] += 1
 
-    all_pools = set()
-    for item in res.values():
-        all_pools.update(item.keys())
-    pools = list(sorted(all_pools))
-
-    sum_per_osd = dict(
-        (name, sum(row.get(i, 0) for i in pools))
-        for name, row in res.items()
-    )
-
-    sum_per_pool = [sum(osd_stat.get(pool_name, 0)
-                    for osd_stat in res.values())
-                    for pool_name in pools]
-
-    jstorage._pg_distr = res, pools, sum_per_osd, sum_per_pool
+    jstorage._pg_distr = osd_pool_pg_2d, sum_per_osd, sum_per_pool
     return jstorage._pg_distr
 
 
-def show_osd_pool_PG_distribution_txt(jstorage):
-    try:
-        data, cols, sum_per_osd, sum_per_pool = calc_osd_pool_PG_distribution(jstorage)
-    except AttributeError:
-        return "No pg dump data. Probably too many PG"
+def get_alive_osd_stats(jstorage):
+    # try to find alive osd
+    for osd_stats in get_osds_info(jstorage):
+        if hasattr(osd_stats, 'mon_osd_full_ratio'):
+            return osd_stats
+    return None
 
-    tab = texttable.Texttable(max_width=180)
-    tab.set_deco(tab.HEADER | tab.VLINES | tab.BORDER)
-    tab.set_cols_align(['l'] + ['r'] * (len(cols) + 1))
-    tab.header(["OSD"] + map(str, cols) + ['sum'])
 
-    for name, row in data.items():
-        idata = [row.get(i, 0) for i in cols]
-        tab.add_row([str(name)] +
-                    map(str, idata) +
-                    [str(sum_per_osd[name])])
+def get_ceph_nets(osd_stats):
+    if osd_stats is None:
+        return None, None
 
-    tab.add_row(["sum"] +
-                map(str, sum_per_pool) +
-                [str(sum(sum_per_pool))])
-
-    return tab.draw()
+    return getattr(osd_stats, 'cluster_network', None), \
+        getattr(osd_stats, 'public_network', None)
 
 
 def show_summary(report, jstorage, storage):
@@ -336,112 +331,58 @@ def show_summary(report, jstorage, storage):
         "</table></center>")
 
     del res[:]
-    osd0_stats = get_osds_info(jstorage)[0]
-    ap("Count", osd_count)
-    ap("PG per OSD", mstorage.status['pgmap']['num_pgs'] / osd_count)
-    ap("Cluster net", osd0_stats.cluster_network)
-    ap("Public net", osd0_stats.public_network)
-    ap("Near full ratio", osd0_stats.mon_osd_nearfull_ratio)
-    ap("Full ratio", osd0_stats.mon_osd_full_ratio)
-    ap("Backfill full ratio", osd0_stats.osd_backfill_full_ratio)
-    ap("Filesafe full ratio", osd0_stats.osd_failsafe_full_ratio)
-    ap("Journal aio", osd0_stats.journal_aio)
-    ap("Journal dio", osd0_stats.journal_dio)
+
+    osd_stats = get_alive_osd_stats(jstorage)
+
+    if osd_stats is None:
+        res.append('<font color="red"><H3>No live OSD found!</H3></font><br>')
+    else:
+        pub_net, cluster_net = get_ceph_nets(osd_stats)
+
+        ap("Count", osd_count)
+        ap("PG per OSD", mstorage.status['pgmap']['num_pgs'] / osd_count)
+        ap("Cluster net", cluster_net)
+        ap("Public net", pub_net)
+        ap("Near full ratio", osd_stats.mon_osd_nearfull_ratio)
+        ap("Full ratio", osd_stats.mon_osd_full_ratio)
+        ap("Backfill full ratio", osd_stats.osd_backfill_full_ratio)
+        ap("Filesafe full ratio", osd_stats.osd_failsafe_full_ratio)
+        ap("Journal aio", osd_stats.journal_aio)
+        ap("Journal dio", osd_stats.journal_dio)
 
     report.divs.append(
         '<center>OSD:<table border="0" cellpadding="5">' +
         "\n".join(res) +
         "</table></center>")
+    del res[:]
 
+    ap("Client IO MBps",
+        "%0.2f" % (mstorage.status['pgmap'].get('write_bytes_sec', 0) / 2.0 ** 20))
+    ap("Client IO IOPS", mstorage.status['pgmap'].get('op_per_sec', 0))
 
-html_ok = '<font color="green">{0}</font>'.format
-html_fail = '<font color="red">{0}</font>'.format
+    report.divs.append(
+        '<center>Activity:<table border="0" cellpadding="5">' +
+        "\n".join(res) +
+        "</table></center>")
+    del res[:]
 
+    report.next_line()
 
-def show_osd_info(report, jstorage, storage):
-    try:
-        _, _, sum_per_osd, _ = calc_osd_pool_PG_distribution(jstorage)
-    except AttributeError:
-        sum_per_osd = None
-
-    table = html.Table(header_row=["OSD",
-                                   "node",
-                                   "status",
-                                   "daemon<br>run",
-                                   "weight<br>reweight",
-                                   "PG count",
-                                   "used GB",
-                                   "free GB",
-                                   "free %",
-                                   "Journal<br>on same<br>disk",
-                                   "Journal<br>on SSD",
-                                   "Journal<br>on file"])
-
-    for osd_stats in sorted(get_osds_info(jstorage), key=lambda x: x.id):
-        used_b = osd_stats.data_stor_stats['used']
-        avail_b = osd_stats.data_stor_stats['avail']
-
-        avail_perc = int((avail_b * 100.0) / (avail_b + used_b) + 0.499999999999)
-
-        if avail_perc < 20:
+    messages = ""
+    for msg in mstorage.status['health']['summary']:
+        if msg['severity'] == "HEALTH_WARN":
+            color = "orange"
+        elif msg['severity'] == "HEALTH_ERR":
             color = "red"
-        elif avail_perc < 40:
-            color = "yellow"
         else:
-            color = "green"
+            color = "black"
 
-        try:
-            ok, frmt, data = storage['osd/{0}/osd_daemons'.format(osd_stats.id)]
-            for line in data.split("\n"):
-                if 'ceph-osd' in line and '-i {0}'.format(osd_stats.id) in line:
-                    daemon_msg = '<font color="green">yes</font>'
-                    break
-            else:
-                daemon_msg = '<font color="red">no</font>'
-        except KeyError:
-            daemon_msg = '<font color="orange">???</font>'
+        messages += '<font color="{0}">{1}</font><br>\n'.format(color, msg['summary'])
 
-        if osd_stats.data_stor_stats['root_dev'] == osd_stats.j_stor_stats['root_dev']:
-            j_on_same_drive = html_fail("yes")
-        else:
-            j_on_same_drive = html_ok("no")
-
-        if osd_stats.data_stor_stats['dev'] != osd_stats.j_stor_stats['dev']:
-            j_on_file = html_ok("no")
-        else:
-            j_on_file = html_fail("yes")
-
-        if osd_stats.j_stor_stats['is_ssd']:
-            j_on_ssd = html_ok("yes")
-        else:
-            j_on_ssd = html_fail("no")
-
-        if osd_stats.status == 'up':
-            status = html_ok("up")
-        else:
-            status = html_fail("down")
-
-        table.rows.append(
-            map(str,
-                [osd_stats.id,
-                 osd_stats.node,
-                 status,
-                 daemon_msg,
-                 "%.3f<br>%.3f" % (
-                    float(osd_stats.crush_weight),
-                    float(osd_stats.reweight)),
-                 sum_per_osd[osd_stats.id] if sum_per_osd is not None else "No data",
-                 used_b / 1024 ** 3,
-                 avail_b / 1024 ** 3,
-                 '<font color="{0}">{1}</font>'.format(color, avail_perc),
-                 j_on_same_drive,
-                 j_on_ssd,
-                 j_on_file]))
-
-    report.divs.append("<center><H3>OSD's info:</H3><br>\n" + str(table) + "</center>")
+    report.divs.append(messages)
 
 
-def show_mons_info(report, jstorage):
+def show_mons_info(report, jstorage, storage):
     table = html.Table(header_row=["Name",
                                    "Node",
                                    "Role",
@@ -466,45 +407,7 @@ def show_mons_info(report, jstorage):
     report.divs.append("<center><H3>Monitors info:</H3><br>\n" + str(table) + "</center>")
 
 
-def show_pools_info(report, jstorage):
-    table = html.Table(header_row=["Pool",
-                                   "size",
-                                   "min_size",
-                                   "Kobj",
-                                   "data<br>MB",
-                                   "free<br>MB",
-                                   "read<br>MB",
-                                   "write<br>MB",
-                                   "ruleset",
-                                   "PG",
-                                   "PGP"])
-
-    pool_stats = {}
-    for pool in jstorage.master.rados_df['pools']:
-        assert len(pool['categories']) == 1
-        pool_stats[pool['name']] = pool['categories'][0]
-
-    for pool in sorted(jstorage.master.osd_dump['pools'],
-                       key=lambda pool: pool['pool_name']):
-        stat = pool_stats[pool['pool_name']]
-        vals = [
-            pool['pool_name'],
-            pool['size'],
-            pool['min_size'],
-            int(stat["num_objects"]) / 1024,
-            int(stat["size_bytes"]) / 1024 ** 2,
-            '---',
-            int(stat["read_bytes"]) / 1024 ** 2,
-            int(stat["write_bytes"]) / 1024 ** 2,
-            pool['crush_ruleset'],
-            pool["pg_num"],
-            pool["pg_placement_num"]]
-        table.rows.append(map(str, vals))
-
-    report.divs.append("<center><H3>Pool's stats:</H3><br>\n" + str(table) + "</center>")
-
-
-def show_pg_state(report, jstorage):
+def show_pg_state(report, jstorage, storage):
     statuses = collections.defaultdict(lambda: 0)
     pgmap_stat = jstorage.master.status['pgmap']
 
@@ -521,17 +424,16 @@ def show_pg_state(report, jstorage):
     report.divs.append("<center><H3>PG's status:</H3><br>\n" + str(table) + "</center>")
 
 
-def show_osd_state(report, jstorage):
+def show_osd_state(report, cluster):
     statuses = collections.defaultdict(lambda: [])
 
-    for osd_stat in get_osds_info(jstorage):
-        statuses[osd_stat.status].append(
-            "{0.node}:{0.id}".format(osd_stat))
+    for osd in cluster.osds:
+        statuses[osd.status].append("{0.host}:{0.id}".format(osd))
 
     table = html.Table(header_row=["Status", "Count", "ID's"])
-    for status, nodes in sorted(statuses.items()):
-        table.rows.append([status, len(nodes),
-                           "" if status == "up" else ",".join(nodes)])
+    for status, osds in sorted(statuses.items()):
+        table.rows.append([status, len(osds),
+                           "" if status == "up" else ",".join(osds)])
     report.divs.append("<center><H3>OSD's state:</H3><br>\n" + str(table) + "</center>")
 
 
@@ -558,20 +460,374 @@ def get_node_mem_info(node):
     return info
 
 
-def get_node_ip_addressed(node):
-    ok, frmt, ipa = node.ipa
+def get_node_net_stats(host_name, storage):
+    ok, frmt, netdev = storage['hosts/%s/netdev' % host_name]
     if not ok:
         return None
-
-    info = collections.defaultdict(lambda: [])
     assert frmt == 'txt'
 
-    ip_rr_s = r"inet\s+(?P<ip>\d+\.\d+\.\d+\.\d+)/(?P<size>\d+)\s+.*?\s+scope\s+global\s+(?P<adapter>[^ \t\r\n]*)"
+    cols_s = "rbytes rpackets rerrs rdrop rfifo rframe rcompressed "
+    cols_s += "rmulticast sbytes spackets serrs sdrop sfifo scolls "
+    cols_s += "scarrier scompressed"
+    cols = cols_s.split()
 
-    for match in re.finditer(ip_rr_s, ipa):
-        info[match.group('adapter')].append(match.group('ip'))
+    info = {}
+    for line in netdev.strip().split("\n")[2:]:
+        adapter, data = line.split(":")
+        assert adapter not in info
+        info[adapter] = dict(zip(cols, map(int, data.split())))
 
     return info
+
+
+class Maybe(object):
+    def __init__(self, tp, obj=None):
+        self.__tp = tp
+        self.__obj = obj
+
+
+class CephOSD(object):
+    def __init__(self):
+        self.id = None
+        self.status = None
+        self.host = None
+        self.daemon_runs = None
+        self.pg_count = None
+
+
+def find(lst, check, default=None):
+    for obj in lst:
+        if check(obj):
+            return obj
+    return default
+
+
+class CephCluster(object):
+    def __init__(self, jstorage, storage):
+        self.osds = []
+        self.mons = []
+        self.pools = {}
+        self.nodes = []
+
+        self.osd_tree = {}
+        self.osd_tree_root_id = None
+        # self.osd_tree_hosts_ids = []
+        # self.osd_tree_osd_ids = []
+
+        self.cluster_net = Maybe(IPNetwork)
+        self.public_net = Maybe(IPNetwork)
+        self.storage = storage
+        self.jstorage = jstorage
+
+    def load(self):
+        self.load_osd_tree()
+        self.osd_pool_pg_2d, \
+            self.sum_per_osd, \
+            self.sum_per_pool = osd_pool_PG_distribution(self.jstorage)
+
+        self.load_cluster_networks()
+        self.load_osds()
+        self.load_pools()
+
+    def load_cluster_networks(self):
+        osd_stats = get_alive_osd_stats(self.jstorage)
+
+        if osd_stats is not None:
+            pub_net_str, cluster_net_str = get_ceph_nets(osd_stats)
+            self.public_net = IPNetwork(pub_net_str)
+            self.cluster_net = IPNetwork(cluster_net_str)
+        else:
+            self.cluster_net = None
+            self.public_net = None
+
+    def load_osd_tree(self):
+        nodes = self.jstorage.master.osd_tree['nodes']
+
+        self.osd_tree_root_id = nodes[0]['id']
+        self.osd_tree = dict((node['id'], node) for node in nodes)
+
+        # set backtrack links
+        def fill_parent(obj, parent_id=None):
+            obj['parent'] = parent_id
+            if 'children' in obj:
+                for child_id in obj['children']:
+                    fill_parent(self.osd_tree[child_id], obj['id'])
+
+        fill_parent(self.osd_tree[self.osd_tree_root_id])
+
+    def find_host_for_node(self, node):
+        cnode = node
+        while cnode['type'] != 'host':
+            if cnode['parent'] is None:
+                raise IndexError("Can't found host for " + str(node['id']))
+            cnode = self.osd_tree[cnode['parent']]
+        return cnode
+
+    def load_osds(self):
+        self.osds = [load_osd(self.jstorage, self.storage,
+                              node, self.find_host_for_node(node))
+                     for node in self.osd_tree.values()
+                     if node['type'] == 'osd']
+        self.osds.sort(key=lambda x: x.id)
+
+    def load_pools(self):
+        self.pools = {}
+
+        for pool_part in self.jstorage.master.osd_dump['pools']:
+            pool = Pool()
+            pool.id = pool_part['pool']
+            pool.name = pool_part['pool_name']
+            pool.__dict__.update(pool_part)
+            self.pools[int(pool.id)] = pool
+
+        for pool_part in self.jstorage.master.rados_df['pools']:
+            assert len(pool_part['categories']) == 1
+            cat = pool_part['categories'][0].copy()
+            del cat['name']
+            self.pools[int(pool_part['id'])].__dict__.update(cat)
+
+
+class Pool(object):
+    def __init__(self):
+        self.id = None
+        self.name = None
+
+
+def show_pools_info(report, cluster):
+    table = html.Table(header_row=["Pool",
+                                   "Id",
+                                   "size",
+                                   "min_size",
+                                   "Kobj",
+                                   "data<br>MB",
+                                   "free<br>MB",
+                                   "read<br>MB",
+                                   "write<br>MB",
+                                   "ruleset",
+                                   "PG",
+                                   "PGP"])
+
+    for _, pool in sorted(cluster.pools.items()):
+        vals = [pool.name,
+                pool.id,
+                pool.size,
+                pool.min_size,
+                int(pool.num_objects) / 1024,
+                int(pool.size_bytes) / 1024 ** 2,
+                '---',
+                int(pool.read_bytes) / 1024 ** 2,
+                int(pool.write_bytes) / 1024 ** 2,
+                pool.crush_ruleset,
+                pool.pg_num,
+                pool.pg_placement_num]
+        table.rows.append(map(str, vals))
+
+    report.divs.append("<center><H3>Pool's stats:</H3><br>\n" + str(table) + "</center>")
+
+
+def load_osd(jstorage, storage, node, host):
+    osd = CephOSD()
+    osd.__dict__.update(node)
+    osd.host = host['name']
+
+    try:
+        osd_data = getattr(jstorage.osd, str(node['id']))
+        osd.data_stor_stats = osd_data.data.stats
+        osd.j_stor_stats = osd_data.journal.stats
+    except AttributeError:
+        osd.data_stor_stats = None
+        osd.j_stor_stats = None
+
+    osd.osd_perf = find(jstorage.master.osd_perf["osd_perf_infos"],
+                        lambda x: x['id'] == osd.id)["perf_stats"]
+
+    data = storage.get('osd/{0}/osd_daemons'.format(osd.id))
+    if data is None:
+        osd.daemon_runs = None
+    else:
+        for line in data.split("\n"):
+            if 'ceph-osd' in line and '-i {0}'.format(osd.id) in line:
+                osd.daemon_runs = True
+                break
+        else:
+            osd.daemon_runs = False
+
+    _, sum_per_osd, _ = osd_pool_PG_distribution(jstorage)
+
+    if sum_per_osd is not None:
+        osd.pg_count = sum_per_osd[osd.id]
+    else:
+        osd.pg_count = None
+
+    return osd
+
+
+HTML_UNKNOWN = '<font color="orange">???</font>'
+html_ok = '<font color="green">{0}</font>'.format
+html_fail = '<font color="red">{0}</font>'.format
+
+
+def show_osd_info(report, cluster):
+    table = html.Table(header_row=["OSD",
+                                   "node",
+                                   "status",
+                                   "daemon<br>run",
+                                   "weight<br>reweight",
+                                   "PG count",
+                                   "used GB",
+                                   "free GB",
+                                   "free %",
+                                   "apply lat<br>ms",
+                                   "commit lat<br>ms",
+                                   "Journal<br>on same<br>disk",
+                                   "Journal<br>on SSD",
+                                   "Journal<br>on file"])
+
+    for osd in cluster.osds:
+        if osd.daemon_runs is None:
+            daemon_msg = HTML_UNKNOWN
+        elif osd.daemon_runs:
+            daemon_msg = '<font color="green">yes</font>'
+        else:
+            daemon_msg = '<font color="red">no</font>'
+
+        if osd.data_stor_stats is not None:
+            used_b = osd.data_stor_stats.get('used')
+            avail_b = osd.data_stor_stats.get('avail')
+            avail_perc = int((avail_b * 100.0) / (avail_b + used_b) + 0.5)
+
+            used_gb = used_b / 1024 ** 3
+            avail_gb = avail_b / 1024 ** 3
+
+            if avail_perc < 20:
+                color = "red"
+            elif avail_perc < 40:
+                color = "yellow"
+            else:
+                color = "green"
+            avail_perc_str = '<font color="{0}">{1}</font>'.format(color, avail_perc)
+
+            if osd.data_stor_stats['root_dev'] == osd.j_stor_stats['root_dev']:
+                j_on_same_drive = html_fail("yes")
+            else:
+                j_on_same_drive = html_ok("no")
+
+            if osd.data_stor_stats['dev'] != osd.j_stor_stats['dev']:
+                j_on_file = html_ok("no")
+            else:
+                j_on_file = html_fail("yes")
+
+            if osd.j_stor_stats['is_ssd']:
+                j_on_ssd = html_ok("yes")
+            else:
+                j_on_ssd = html_fail("no")
+        else:
+            used_gb = HTML_UNKNOWN
+            avail_gb = HTML_UNKNOWN
+            avail_perc_str = HTML_UNKNOWN
+            j_on_same_drive = HTML_UNKNOWN
+            j_on_file = HTML_UNKNOWN
+
+        if osd.status == 'up':
+            status = html_ok("up")
+        else:
+            status = html_fail("down")
+
+        if osd.osd_perf is not None:
+            apply_latency_ms = osd.osd_perf["apply_latency_ms"]
+            commit_latency_ms = osd.osd_perf["commit_latency_ms"]
+        else:
+            apply_latency_ms = HTML_UNKNOWN
+            commit_latency_ms = HTML_UNKNOWN
+
+        if osd.pg_count is None:
+            pg_count = HTML_UNKNOWN
+        else:
+            pg_count = osd.pg_count
+
+        table.rows.append(
+            map(str,
+                [osd.id,
+                 osd.host,
+                 status,
+                 daemon_msg,
+                 "%.3f<br>%.3f" % (
+                    float(osd.crush_weight),
+                    float(osd.reweight)),
+                 pg_count,
+                 used_gb,
+                 avail_gb,
+                 avail_perc_str,
+                 apply_latency_ms,
+                 commit_latency_ms,
+                 j_on_same_drive,
+                 j_on_ssd,
+                 j_on_file]))
+
+    report.divs.append("<center><H3>OSD's info:</H3><br>\n" + str(table) + "</center>")
+
+
+class Node(object):
+    def __init__(self, name):
+        self.name = name
+        self.ceph_cluster_adapter = Maybe(NodeNetworkInfo)
+        self.ceph_public_adapter = Maybe(NodeNetworkInfo)
+        self.net_adapters = {}
+        self.disks = {}
+
+
+class NodeNetworkInfo(object):
+    def __init__(self):
+        self.adapter = None
+        self.network = None
+        self.ip = None
+        self.perf_stats = None
+
+
+def get_node_ceph_net_stats(host_name, jstorage, storage):
+    ok, frmt, ipa = storage['hosts/%s/ipa' % host_name]
+    assert ok and frmt == 'txt'
+
+    ip_rr_s = r"\d+:\s+(?P<adapter>.*?)\s+inet\s+(?P<ip>\d+\.\d+\.\d+\.\d+)/(?P<size>\d+)"
+    info = collections.defaultdict(lambda: [])
+    for line in ipa.split("\n"):
+        match = re.match(ip_rr_s, line)
+        if match is not None:
+            info[match.group('adapter')].append(
+                (match.group('ip'), match.group('size')))
+
+    osd_stats = get_alive_osd_stats(jstorage)
+
+    # node = CephNode()
+    node = type('CephNode', (object,), {})()
+
+    if osd_stats is not None:
+        pub_net_str, cluster_net_str = get_ceph_nets(osd_stats)
+    else:
+        return node
+
+    node.cluster_net = NodeNetworkInfo()
+    node.public_net = NodeNetworkInfo()
+
+    node.public_net.network = IPNetwork(pub_net_str)
+    node.cluster_net.network = IPNetwork(cluster_net_str)
+
+    for adapter, ips_with_sizes in info.items():
+        for ip, sz in ips_with_sizes:
+            if IPAddress(ip) in node.public_net.network:
+                node.public_net.adapter = adapter
+                node.public_net.ip = ip
+
+            if IPAddress(ip) in node.cluster_net.network:
+                node.cluster_net.adapter = adapter
+                node.cluster_net.ip = ip
+
+    net_stats = get_node_net_stats(host_name, storage)
+    for net in (node.cluster_net, node.public_net):
+        if net.adapter is not None:
+            net.perf_stats = net_stats.get(net.adapter)
+
+    return node
 
 
 def get_node_load_5m(node):
@@ -581,9 +837,20 @@ def get_node_load_5m(node):
     return int(float(loadavg.strip().split()[1]))
 
 
-def show_hosts_stats(report, storage):
-    header_row = ["Hostname", "CPU's", "RAM<br>total", "RAM<br>free",
-                  "Swap<br>used", "Net info<br>Dev, speed, duplex<br>[IP addrs]", "Load avg<br>5 min"]
+def show_hosts_stats(report, jstorage, storage):
+    header_row = ["Hostname",
+                  "Ceph services",
+                  "CPU's",
+                  "RAM<br>total",
+                  "RAM<br>free",
+                  "Swap<br>used",
+                  "Cluster net<br>dev, ip<br>settings",
+                  "Cluster net<br>average<br>send/recv",
+                  "Cluster net<br>current<br>send/recv",
+                  "Public net<br>dev, ip<br>settings",
+                  "Public net<br>average<br>send/recv",
+                  "Public net<br>current<br>send/recv",
+                  "Load avg<br>5 min"]
     table = html.Table(header_row=header_row)
     ok, _, hosts = storage.hosts
     assert ok
@@ -596,9 +863,18 @@ def show_hosts_stats(report, storage):
             continue
         assert frmt == 'xml'
 
+        services = ["osd-{0}".format(osd_stat.id)
+                    for osd_stat in get_osds_info(jstorage)
+                    if osd_stat.node == host_name]
+
+        all_mons = [mon_data['name'] for mon_data in jstorage.master.mon_status['monmap']['mons']]
+        if host_name in all_mons:
+            services.append("mon(" + host_name + ")")
+
+        host_info = [host_name, "<br>".join(services)]
+
         hw_info = get_hw_info(lshw)
 
-        host_info = []
         if hw_info.cores == []:
             host_info.append("Error")
         else:
@@ -609,43 +885,53 @@ def show_hosts_stats(report, storage):
         host_info.append(b2ssize(mem_info['MemFree']))
         host_info.append(b2ssize(mem_info['SwapTotal'] - mem_info['SwapFree']))
 
-        ip_addr = get_node_ip_addressed(node)
+        ceph_node = get_node_ceph_net_stats(host_name, jstorage, storage)
 
-        if hw_info.net_info != {}:
-            net_info = []
-            for name, (speed, dtype, _) in hw_info.net_info.items():
-                net_info.append("{0}, {1}, {2}".format(name, speed, dtype))
-                if name in ip_addr:
-                    net_info[-1] += "<br>" + ",".join(ip_addr[name])
-            host_info.append("<br/>".join(net_info))
-        else:
-            host_info.append("Error")
+        for net in (ceph_node.cluster_net, ceph_node.public_net):
+            if net is None:
+                host_info.append("No data")
+                host_info.append("No data")
+            else:
+                dev_ip = "{0}<br>{1}".format(net.adapter, net.ip)
+                if net.adapter not in hw_info.net_info:
+                    settings = "No data"
+                else:
+                    speed, dtype, _ = hw_info.net_info[net.adapter]
+                    settings = "{0}, {1}".format(speed, dtype)
+                host_info.append("{0}<br>{1}".format(dev_ip, settings))
+
+                host_info.append("{0} / {1}<br>{2} / {3}".format(
+                    net.perf_stats['sbytes'] / 1024 ** 2,
+                    net.perf_stats['rbytes'] / 1024 ** 2,
+                    net.perf_stats['spackets'] / 1000,
+                    net.perf_stats['rpackets'] / 1000
+                ))
+                host_info.append('---')
 
         host_info.append(get_node_load_5m(node))
-
-        table.rows.append([host_name] + map(str, host_info))
+        table.rows.append(map(str, host_info))
 
     report.divs.append("<center><H3>Host's info:</H3><br>\n" + str(table) + "</center>")
 
 
-def show_osd_pool_PG_distribution_html(report, jstorage):
-    try:
-        data, cols, sum_per_osd, sum_per_pool = calc_osd_pool_PG_distribution(jstorage)
-    except AttributeError:
+def show_osd_pool_PG_distribution_html(report, cluster):
+    if cluster.sum_per_osd is None:
         report.divs.append("<center><H3>PG per OSD: No pg dump data. Probably too many PG</H3></center>")
         return
 
-    table = html.Table(header_row=["OSD/pool"] + map(str, cols) + ['sum'])
+    pools = sorted(cluster.sum_per_pool)
+    table = html.Table(header_row=["OSD/pool"] + list(pools) + ['sum'])
 
-    for name, row in sorted(data.items()):
-        idata = [row.get(i, 0) for i in cols]
-        table.rows.append([str(name)] +
-                          map(str, idata) +
-                          [str(sum_per_osd[name])])
+    for osd_id, row in sorted(cluster.osd_pool_pg_2d.items()):
+        data = [osd_id] + \
+               [row.get(pool_name, 0) for pool_name in pools] + \
+               [cluster.sum_per_osd[osd_id]]
+
+        table.rows.append(map(str, data))
 
     table.rows.append(["sum"] +
-                      map(str, sum_per_pool) +
-                      [str(sum(sum_per_pool))])
+                      [cluster.sum_per_pool[pool_name] for pool_name in pools] +
+                      [str(sum(cluster.sum_per_pool.values()))])
 
     report.divs.append("<center><H3>PG per OSD:</H3><br>" + str(table) + "</center>")
 
@@ -673,8 +959,44 @@ body {font: 10pt sans;}
 # mynetwork {width: 500px;height: 500px;border: 1px solid lightgray;}
 # mynetwork {width: 500px;height: 500px;border: 1px solid lightgray;}
 
+def_color_map = [
+    (0.0, (0.500, 0.000, 1.000)),
+    (0.1, (0.304, 0.303, 0.988)),
+    (0.2, (0.100, 0.588, 0.951)),
+    (0.3, (0.096, 0.805, 0.892)),
+    (0.4, (0.300, 0.951, 0.809)),
+    (0.5, (0.504, 1.000, 0.705)),
+    (0.6, (0.700, 0.951, 0.588)),
+    (0.7, (0.904, 0.805, 0.451)),
+    (0.8, (1.000, 0.588, 0.309)),
+    (0.9, (1.000, 0.303, 0.153)),
+    (1.0, (1.000, 0.000, 0.000))
+]
 
-def tree_to_visjs(report, jstorage):
+
+def val_to_color(val, color_map=def_color_map):
+    idx = [i[0] for i in color_map]
+    assert idx == sorted(idx)
+
+    pos = bisect.bisect_left(idx, val)
+
+    if pos <= 0:
+        return color_map[0][1]
+
+    if pos > len(idx):
+        return color_map[-1][1]
+
+    color1 = color_map[pos - 1][1]
+    color2 = color_map[pos][1]
+
+    dx1 = (val - idx[pos - 1]) / (idx[pos] - idx[pos - 1])
+    dx2 = (idx[pos] - val) / (idx[pos] - idx[pos - 1])
+
+    ncolor = [(v1 * dx2 + v2 * dx1) * 255 for v1, v2 in zip(color1, color2)]
+    return "#%02X%02X%02X" % tuple(map(int, ncolor))
+
+
+def tree_to_visjs(report, jstorage, storage):
     report.style.append(visjs_css)
     report.style_links.append(
         "https://cdnjs.cloudflare.com/ajax/libs/vis/4.7.0/vis.min.css")
@@ -692,46 +1014,37 @@ def tree_to_visjs(report, jstorage):
                 for node in nodes
                 if node['type'] == 'osd')
 
-    cmap = plt.get_cmap('rainbow') if plt is not None else None
-
     def get_color_w(node):
-        if max_w - min_w < 1E-2 or node['type'] != 'osd' or mcolors is None:
+        if max_w - min_w < 1E-2 or node['type'] != 'osd':
             return "#ffffff"
         w = (float(node['crush_weight']) - min_w) / (max_w - min_w)
-        return str(mcolors.rgb2hex(cmap(w)))
+        return val_to_color(w)
 
     try:
-        _, _, sum_per_osd, _ = calc_osd_pool_PG_distribution(jstorage)
+        _, sum_per_osd, _ = osd_pool_PG_distribution(jstorage)
         min_pg = min(sum_per_osd.values())
         max_pg = max(sum_per_osd.values())
     except AttributeError:
         min_pg = max_pg = sum_per_osd = None
 
     def get_color_pg_count(node):
-        if (max_pg - min_pg) / float(max_pg) < 1E-2 or \
-           node['type'] != 'osd' or mcolors is None:
+        if (max_pg - min_pg) / float(max_pg) < 1E-2 or node['type'] != 'osd':
             return "#ffffff"
 
         w = (float(sum_per_osd[node['id']]) - min_pg) / (max_pg - min_pg)
-        return str(mcolors.rgb2hex(cmap(w)))
+        return val_to_color(w)
 
     def get_graph(color_func):
         nodes_list = []
         eges_list = []
-        if plt is not None:
-            nodes_list = [
-                "{{id:{0}, label:'{1}', color:'{2}'}}".format(
-                    node['id'],
-                    str(node['name']),
-                    color_func(node)
-                )
-                for node in nodes
-            ]
-        else:
-            nodes_list = [
-                "{{id:{0}, label:'{1}'}}".format(node['id'], str(node['name']))
-                for node in nodes
-            ]
+        nodes_list = [
+            "{{id:{0}, label:'{1}', color:'{2}'}}".format(
+                node['id'],
+                str(node['name']),
+                color_func(node)
+            )
+            for node in nodes
+        ]
 
         for node in nodes:
             for child_id in node.get('children', []):
@@ -761,47 +1074,6 @@ def tree_to_visjs(report, jstorage):
         report.divs.append('<center>PG\'s count:</center><br><div class="graph" id="mynetwork1"></div>')
         report.onload.append("draw1()")
     report.next_line()
-
-
-node_templ_gv = '{0} [label="{1}"];'
-link_templ_gv = '{0} -> {1};'
-
-
-def getid(oid):
-    return ("N" + str(oid) if oid >= 0 else "NN" + str(-oid))
-
-
-def tree_to_graphviz(jstorage):
-    res = "digraph cluster{"
-    nodes = jstorage.master.osd_tree["nodes"]
-
-    for node in nodes:
-        res += node_templ_gv.format(getid(node['id']), str(node['name']))
-
-    for node in nodes:
-        for child_id in node.get('children', []):
-            res += link_templ_gv.format(getid(node['id']), getid(child_id))
-
-    return res + "}"
-
-
-node_templ = ".addNode({{id: '{0}', label: '{1}', size: 1}})"
-link_templ = ".addEdge({{id: 'e{0}', source: '{1}', target: '{2}'}})"
-
-
-def tree_to_sigma(jstorage):
-    res = "s.graph"
-    nodes = jstorage.master.osd_tree["nodes"]
-
-    for node in nodes:
-        res += node_templ.format(getid(node['id']), node['name'])
-
-    uniq_id = 0
-    for node in nodes:
-        for uniq_id, child_id in enumerate(node.get('children', []), uniq_id):
-            res += link_templ.format(uniq_id, getid(node['id']), getid(child_id))
-
-    return res
 
 
 def parse_args(argv):
@@ -834,25 +1106,30 @@ def main(argv):
         storage = RawResultStorage(folder)
         jstorage = JResultStorage(storage)
 
+        cluster = CephCluster(jstorage, storage)
+        cluster.load()
+
         report = Report(opts.report_name)
 
         show_summary(report, jstorage, storage)
         report.next_line()
 
-        show_osd_pool_PG_distribution_html(report, jstorage)
+        show_osd_pool_PG_distribution_html(report, cluster)
         report.next_line()
 
-        show_pools_info(report, jstorage)
-        show_osd_info(report, jstorage, storage)
-        show_pg_state(report, jstorage)
+        show_osd_info(report, cluster)
         report.next_line()
 
-        show_osd_state(report, jstorage)
-        show_hosts_stats(report, storage)
-        show_mons_info(report, jstorage)
+        show_pools_info(report, cluster)
+        show_pg_state(report, jstorage, storage)
         report.next_line()
 
-        tree_to_visjs(report, jstorage)
+        show_osd_state(report, cluster)
+        show_hosts_stats(report, jstorage, storage)
+        show_mons_info(report, jstorage, storage)
+        report.next_line()
+
+        tree_to_visjs(report, jstorage, storage)
         print str(report)
     finally:
         if remove_folder:

@@ -135,7 +135,8 @@ class CephDataCollector(Collector):
         assert ok
 
         cmds = ['osd tree', 'df', 'auth list', 'osd dump',
-                'health', 'health detail', 'mon_status', 'osd lspools']
+                'health', 'health detail', 'mon_status', 'osd lspools',
+                'osd perf']
 
         if json.loads(status)['pgmap']['num_pgs'] > self.opts.max_pg_dump_count:
             logger.warning(
@@ -192,22 +193,41 @@ class CephDataCollector(Collector):
 
     def collect_osd(self, path, host, osd_id):
         path = "{0}/osd/{1}/".format(path, osd_id)
+        ok, out = check_output_ssh(host, self.opts, "ps aux | grep ceph-osd")
 
-        osd_cfg_cmd = "sudo ceph -f json --admin-daemon /var/run/ceph/ceph-osd.{0}.asok config show"
-        ok, data = check_output_ssh(host, self.opts, osd_cfg_cmd.format(osd_id))
+        for line in out.split("/n"):
+            if '-i ' + str(osd_id) in line and 'ceph-osd' in line:
+                osd_running = True
+                break
+        else:
+            osd_running = False
 
-        self.emit(path + "config", 'json', ok, data)
-        assert ok
-
-        osd_cfg = json.loads(data)
-        self.emit_device_info(host, path + "journal", str(osd_cfg['osd_journal']))
-        self.emit_device_info(host, path + "data", str(osd_cfg['osd_data']))
-        self.ssh2emit(host, path + "osd_daemons", 'txt', "ps aux | grep ceph-osd")
+        self.emit(path + "osd_daemons", 'txt', ok, out)
         self.ssh2emit(host, path + "log", 'txt',
                       "tail -n {0} /var/log/ceph/ceph-osd.{1}.log".format(
                         self.opts.ceph_log_max_lines,
                         osd_id
                       ))
+
+        if osd_running:
+            osd_cfg_cmd = "sudo ceph -f json --admin-daemon /var/run/ceph/ceph-osd.{0}.asok config show"
+            ok, data = check_output_ssh(host, self.opts, osd_cfg_cmd.format(osd_id))
+
+            self.emit(path + "config", 'json', ok, data)
+            assert ok
+
+            osd_cfg = json.loads(data)
+
+            data_dev = str(osd_cfg['osd_journal'])
+            jdev = str(osd_cfg['osd_data'])
+        else:
+            logger.warning("osd-{0} in node {1} is down.".format(osd_id, host) +
+                           " No config available, will use default data and journal path")
+            data_dev = "/var/lib/ceph/osd/ceph-{0}".format(osd_id)
+            jdev = "/var/lib/ceph/osd/ceph-{0}/journal".format(osd_id)
+
+        self.emit_device_info(host, path + "journal", data_dev)
+        self.emit_device_info(host, path + "data", jdev)
 
     def collect_monitor(self, path, host, name):
         path = "{0}/mon/{1}/".format(path, host)
@@ -244,7 +264,9 @@ class NodeCollector(Collector):
         ("loadavg",   "txt", "cat /proc/loadavg"),
         ("cpuinfo",   "txt", "cat /proc/cpuinfo"),
         ("mount",     "txt", "mount"),
-        ("ipa",       "txt", "ip a")
+        ("ipa",       "txt", "ip -o -4 a"),
+        ("netdev",    "txt", "cat /proc/net/dev"),
+        ("ceph_conf", "txt", "cat /etc/ceph/ceph.conf")
     ]
 
     def collect_node(self, path, host):
@@ -258,13 +280,25 @@ class NodePerformanceCollector(Collector):
     run_alone = True
 
     def collect_node(self, path, host):
-        path = 'hosts/' + host + '/'
+        path = '{0}/hosts/{1}/'.format(path, host)
         self.ssh2emit(host, path + "vmstat", "txt",
                       "vmstat 1 {0}".format(self.opts.stat_collect_seconds))
         self.ssh2emit(host, path + "iostat", "txt",
                       "iostat -x 1 {0}".format(self.opts.stat_collect_seconds))
         self.ssh2emit(host, path + "top", "txt",
                       "top -b -d {0} -n 10".format(self.opts.stat_collect_seconds))
+
+
+class NodeResourseUsageCollector(Collector):
+    name = 'resource'
+    run_alone = True
+
+    def collect_node(self, path, host):
+        cpath = '{0}/perf_stats/{1}/{2}-disk'.format(path, host, int(time.time()))
+        self.ssh2emit(host, cpath, "txt", "cat /proc/diskstats")
+
+        cpath = '{0}/perf_stats/{1}/{2}-net'.format(path, host, int(time.time()))
+        self.ssh2emit(host, cpath, "txt", "cat /proc/net/dev")
 
 
 # class CephPerformanceCollector(Collector):
@@ -410,6 +444,7 @@ ALL_COLLECTORS = [
     CephDataCollector,
     NodeCollector,
     NodePerformanceCollector,
+    NodeResourseUsageCollector
     # CephPerformanceCollector
 ]
 
@@ -437,13 +472,17 @@ def parse_args(argv):
                    default=60, type=int, metavar="SEC",
                    help="Collect performance stats for SEC seconds")
 
+    p.add_argument("-u", "--usage-collect-interval",
+                   default=60, type=int, metavar="SEC",
+                   help="Collect usage for at lease SEC seconds")
+
     p.add_argument("-d", "--disable", default=[],
                    nargs='*', help="Disable collect pattern")
 
     p.add_argument("--ceph-log-max-lines", default=1000,
                    type=int, help="Max lines from osd/mon log")
 
-    p.add_argument("--collectors", default="ceph,node",
+    p.add_argument("--collectors", default="ceph,node,resource",
                    help="Coma separated list of collectors" +
                    "select from : " +
                    ",".join(coll.name for coll in ALL_COLLECTORS))
@@ -497,8 +536,14 @@ def main(argv):
     collectors = [
         collector_class(opts, collector_settings, res_q)
         for collector_class in ALL_COLLECTORS
-        if collector_class.name in allowed_collectors
+        if collector_class.name in allowed_collectors and
+        NodeResourseUsageCollector.name != collector_class.name
     ]
+
+    if NodeResourseUsageCollector.name in allowed_collectors:
+        nruc = NodeResourseUsageCollector(opts, collector_settings, res_q)
+    else:
+        nruc = None
 
     nodes = discover_nodes(opts)
     nodes['master'][None] = [{}]
@@ -511,6 +556,11 @@ def main(argv):
                     sum(map(len, nodes_with_args.values())), role)
 
     logger.info("Found %s hosts total", len(nodes['node']))
+
+    # collect data at the beginning
+    if nruc is not None:
+        for node, _ in nodes['node'].items():
+            run_q.put((nruc.collect_node, "", node, {}))
 
     for role, nodes_with_args in nodes.items():
         for collector in collectors:
@@ -525,7 +575,20 @@ def main(argv):
     save_results_thread.daemon = True
     save_results_thread.start()
 
+    t1 = time.time()
     run_all(opts, run_q)
+
+    # collect data at the end
+    if nruc is not None:
+        dt = opts.usage_collect_interval - (time.time() - t1)
+        if dt > 0:
+            logger.info("Will wait for {0} seconds for usage collection".format(int(dt)))
+            for i in range(int(dt / 0.1)):
+                time.sleep(0.1)
+        logger.info("Start final usage collection")
+        for node, _ in nodes['node'].items():
+            run_q.put((nruc.collect_node, "", node, {}))
+        run_all(opts, run_q)
 
     res_q.put(None)
     save_results_thread.join()
