@@ -266,7 +266,8 @@ class NodeCollector(Collector):
         ("mount",     "txt", "mount"),
         ("ipa",       "txt", "ip -o -4 a"),
         ("netdev",    "txt", "cat /proc/net/dev"),
-        ("ceph_conf", "txt", "cat /etc/ceph/ceph.conf")
+        ("ceph_conf", "txt", "cat /etc/ceph/ceph.conf"),
+        ("uptime",    "txt", "cat /proc/uptime"),
     ]
 
     def collect_node(self, path, host):
@@ -491,7 +492,7 @@ def parse_args(argv):
                    type=int,
                    help="maximum PG count to by dumped with 'pg dump' cmd")
 
-    p.add_argument("-r", "--result", default=None, help="Result file")
+    p.add_argument("-o", "--result", default=None, help="Result file")
 
     p.add_argument("-f", "--keep-folder", default=False,
                    action="store_true",
