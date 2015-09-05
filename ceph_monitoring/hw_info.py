@@ -29,18 +29,27 @@ RSMAP = [('K', 1024),
          ('T', 1024 ** 4)]
 
 
-def b2ssize(size):
+def b2ssize(size, add_i=True):
     if size < 1024:
-        return str(size)
+        if size == 0:
+            return "0"
+        elif size < 1:
+            return "{0:.2e}".format(size)
+        elif isinstance(size, float):
+            return "{0:.1f}".format(size)
+        else:
+            return str(size)
 
+    i = 'i' if add_i else ''
     for name, scale in RSMAP:
         if size < 1024 * scale:
             if size % scale == 0:
-                return "{0} {1}i".format(size // scale, name)
+                val = size // scale
+                return "{0} {1}{2}".format(val, name, i)
             else:
-                return "{0:.1f} {1}i".format(float(size) / scale, name)
+                return "{0:.1f} {1}{2}".format(float(size) / scale, name, i)
 
-    return "{0}{1}i".format(size // scale, name)
+    return "{0} {1}{2}".format(size // scale, name, i)
 
 
 class HWInfo(object):

@@ -14,6 +14,9 @@ class CephOSD(object):
         self.pg_count = None
         self.config = None
 
+        self.data_stor_stats = None
+        self.j_stor_stats = None
+
 
 class CephMonitor(object):
     def __init__(self):
@@ -58,6 +61,52 @@ class TabulaRasa(object):
     pass
 
 
+DiskStats = collections.namedtuple(
+    "DiskStats",
+    ["major",
+     "minor",
+     "device",
+     "reads_completed",
+     "reads_merged",
+     "sectors_read",
+     "read_time",
+     "writes_completed",
+     "writes_merged",
+     "sectors_written",
+     "write_time",
+     "in_progress_io",
+     "io_time",
+     "weighted_io_time"]
+)
+
+
+NetStats = collections.namedtuple(
+    "NetStats",
+    ("rbytes rpackets rerrs rdrop rfifo rframe rcompressed" +
+     " rmulticast sbytes spackets serrs sdrop sfifo scolls" +
+     " scarrier scompressed").split()
+)
+
+
+def parse_netdev(netdev):
+    info = {}
+    for line in netdev.strip().split("\n")[2:]:
+        adapter, data = line.split(":")
+        assert adapter not in info
+        info[adapter] = NetStats(*map(int, data.split()))
+
+    return info
+
+
+def parse_diskstats(diskstats):
+    info = {}
+    for line in diskstats.strip().split("\n"):
+        data = line.split()
+        data_i = map(int, data[:2]) + [data[2]] + map(int, data[3:])
+        info[data[2]] = DiskStats(*data_i)
+    return info
+
+
 def find(lst, check, default=None):
     for obj in lst:
         if check(obj):
@@ -70,7 +119,7 @@ class CephCluster(object):
         self.osds = []
         self.mons = []
         self.pools = {}
-        self.hosts = []
+        self.hosts = {}
 
         self.osd_tree = {}
         self.osd_tree_root_id = None
@@ -99,6 +148,9 @@ class CephCluster(object):
         self.load_pools()
         self.load_monitors()
         self.load_hosts()
+
+        for host in self.hosts.values():
+            host.curr_perf_stats = self.get_perf_stats(host.name)
 
         data = self.storage.get('master/collected_at')
         assert data is not None
@@ -152,7 +204,17 @@ class CephCluster(object):
                 for child_id in obj['children']:
                     fill_parent(self.osd_tree[child_id], obj['id'])
 
+        # set hosts
+        def fill_host(obj, host=None):
+            obj['host'] = host
+            if obj['type'] == 'host':
+                host = obj['name']
+            if 'children' in obj:
+                for child_id in obj['children']:
+                    fill_host(self.osd_tree[child_id], host)
+
         fill_parent(self.osd_tree[self.osd_tree_root_id])
+        fill_host(self.osd_tree[self.osd_tree_root_id])
 
     def find_host_for_node(self, node):
         cnode = node
@@ -170,7 +232,7 @@ class CephCluster(object):
             osd = CephOSD()
             self.osds.append(osd)
             osd.__dict__.update(node)
-            osd.host = node['name']
+            osd.host = node['host']
 
             try:
                 osd_data = getattr(self.jstorage.osd, str(node['id']))
@@ -235,20 +297,10 @@ class CephCluster(object):
             self.mons.append(mon)
 
     def get_node_net_stats(self, host_name):
-        netdev = self.storage.get('hosts/{0}/netdev'.format(host_name))
+        return parse_netdev(self.storage.get('hosts/{0}/netdev'.format(host_name)))
 
-        cols_s = "rbytes rpackets rerrs rdrop rfifo rframe rcompressed "
-        cols_s += "rmulticast sbytes spackets serrs sdrop sfifo scolls "
-        cols_s += "scarrier scompressed"
-        cols = cols_s.split()
-
-        info = {}
-        for line in netdev.strip().split("\n")[2:]:
-            adapter, data = line.split(":")
-            assert adapter not in info
-            info[adapter] = dict(zip(cols, map(int, data.split())))
-
-        return info
+    def get_node_disk_stats(self, host_name):
+        return parse_netdev(self.storage.get('hosts/{0}/diskstats'.format(host_name)))
 
     def load_PG_distribution(self):
         try:
@@ -299,7 +351,7 @@ class CephCluster(object):
             stor_node = self.storage.get("hosts/" + json_host['name'], expected_format=None)
 
             host = Host(json_host['name'])
-            self.hosts.append(host)
+            self.hosts[host.name] = host
 
             try:
                 lshw_xml = stor_node.get('lshw', expected_format='xml')
@@ -342,7 +394,22 @@ class CephCluster(object):
 
             host.uptime = float(stor_node.get('uptime').split()[0])
 
-    def get_perf_diff(self, host_name):
-        for stat_name in self.storage.get("perf_stats/" + host_name, expected_format=None):
-            pass
+    def get_perf_stats(self, host_name):
+        stats = collections.defaultdict(lambda: [])
+        host_stats = self.storage.get("perf_stats/" + host_name, expected_format=None)
+        for stat_name in host_stats:
+            collect_time, stat_type = stat_name.split("-")
 
+            if stat_type == 'disk':
+                stat = parse_diskstats(host_stats.get(stat_name))
+            elif stat_type == 'net':
+                stat = parse_netdev(host_stats.get(stat_name))
+            else:
+                raise ValueError("Unknown stat type - {!r}".format(stat_type))
+
+            stats[stat_type].append([int(collect_time), stat])
+
+        for stat_list in stats.values():
+            stat_list.sort()
+
+        return stats
