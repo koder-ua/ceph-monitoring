@@ -1,4 +1,6 @@
 import re
+import datetime
+import functools
 import collections
 
 from ipaddr import IPNetwork, IPAddress
@@ -55,37 +57,45 @@ class Host(object):
         self.net_adapters = {}
         self.disks = {}
         self.uptime = None
+        self.perf_monitoring = None
+        self.rusage_stats = None
 
 
 class TabulaRasa(object):
     pass
 
 
-DiskStats = collections.namedtuple(
-    "DiskStats",
-    ["major",
-     "minor",
-     "device",
-     "reads_completed",
-     "reads_merged",
-     "sectors_read",
-     "read_time",
-     "writes_completed",
-     "writes_merged",
-     "sectors_written",
-     "write_time",
-     "in_progress_io",
-     "io_time",
-     "weighted_io_time"]
-)
+class DevLoadLog(object):
+    def __init__(self, name, start_timstamp):
+        self.name = name
+        self.values = []
+        self.start_timstamp = start_timstamp
 
 
-NetStats = collections.namedtuple(
-    "NetStats",
-    ("rbytes rpackets rerrs rdrop rfifo rframe rcompressed" +
-     " rmulticast sbytes spackets serrs sdrop sfifo scolls" +
-     " scarrier scompressed").split()
-)
+diskstat_fields = [
+    "major",
+    "minor",
+    "device",
+    "reads_completed",
+    "reads_merged",
+    "sectors_read",
+    "read_time",
+    "writes_completed",
+    "writes_merged",
+    "sectors_written",
+    "write_time",
+    "in_progress_io",
+    "io_time",
+    "weighted_io_time"]
+
+DiskStats = collections.namedtuple("DiskStats", diskstat_fields)
+
+
+netstat_fields = ("rbytes rpackets rerrs rdrop rfifo rframe rcompressed" +
+                  " rmulticast sbytes spackets serrs sdrop sfifo scolls" +
+                  " scarrier scompressed").split()
+
+NetStats = collections.namedtuple("NetStats", netstat_fields)
 
 
 def parse_netdev(netdev):
@@ -112,6 +122,42 @@ def find(lst, check, default=None):
         if check(obj):
             return obj
     return default
+
+
+def load_performance_log_file(str_data, fields, skip=0, field_types=None):
+    # first line - collection start time
+    lines = iter(str_data.split("\n"))
+
+    # Mon Sep  7 21:08:26 UTC 2015
+    sdate = datetime.datetime.strptime(next(lines), "%a %b %d %H:%M:%S UTC %Y")
+    timestamp = (sdate - datetime.datetime(1970, 1, 1)).total_seconds()
+
+    per_dev = {}
+
+    if field_types is None:
+        fied_tr = functools.partial(map, float)
+    else:
+        def fied_tr(data):
+            return [func(val) for func, val in zip(field_types, data)]
+
+    for line in lines:
+        line = line.strip()
+        if line == '':
+            continue
+
+        items = line.split()[skip:]
+        dev = items[0]
+
+        if dev not in per_dev:
+            per_dev[dev] = obj = DevLoadLog(dev, timestamp)
+        else:
+            obj = per_dev[items[0]]
+
+        tr = TabulaRasa()
+        tr.__dict__.update(zip(fields, fied_tr(items[1:])))
+        obj.values.append(tr)
+
+    return per_dev
 
 
 class CephCluster(object):
@@ -150,7 +196,8 @@ class CephCluster(object):
         self.load_hosts()
 
         for host in self.hosts.values():
-            host.curr_perf_stats = self.get_perf_stats(host.name)
+            host.rusage_stats = self.get_rusage_stats(host.name)
+            host.perf_monitoring = self.get_perf_monitoring(host.name)
 
         data = self.storage.get('master/collected_at')
         assert data is not None
@@ -184,11 +231,11 @@ class CephCluster(object):
         osd = self.get_alive_osd()
         if osd is not None:
             cluster_net_str = osd.config.get('cluster_network')
-            if cluster_net_str is not None:
+            if cluster_net_str is not None and cluster_net_str != "":
                 self.cluster_net = IPNetwork(cluster_net_str)
 
             public_net_str = osd.config.get('public_network', None)
-            if public_net_str is not None:
+            if public_net_str is not None and public_net_str != "":
                 self.public_net = IPNetwork(public_net_str)
 
     def load_osd_tree(self):
@@ -261,10 +308,7 @@ class CephCluster(object):
             else:
                 osd.pg_count = None
 
-            try:
-                osd.config = self.jstorage.osd.get("{0}/config".format(osd.id))
-            except AttributeError:
-                pass
+            osd.config = self.jstorage.osd.get("{0}/config".format(osd.id))
 
         self.osds.sort(key=lambda x: x.id)
 
@@ -279,10 +323,13 @@ class CephCluster(object):
             self.pools[int(pool.id)] = pool
 
         for pool_part in self.jstorage.master.rados_df['pools']:
-            assert len(pool_part['categories']) == 1
-            cat = pool_part['categories'][0].copy()
-            del cat['name']
-            self.pools[int(pool_part['id'])].__dict__.update(cat)
+            if 'categories' not in pool_part:
+                self.pools[int(pool_part['id'])].__dict__.update(pool_part)
+            else:
+                assert len(pool_part['categories']) == 1
+                cat = pool_part['categories'][0].copy()
+                del cat['name']
+                self.pools[int(pool_part['id'])].__dict__.update(cat)
 
     def load_monitors(self):
         srv_health = self.jstorage.master.status['health']['health']['health_services']
@@ -353,9 +400,9 @@ class CephCluster(object):
             host = Host(json_host['name'])
             self.hosts[host.name] = host
 
-            try:
-                lshw_xml = stor_node.get('lshw', expected_format='xml')
-            except AttributeError:
+            lshw_xml = stor_node.get('lshw', expected_format='xml')
+
+            if lshw_xml is None:
                 host.hw_info = None
             else:
                 host.hw_info = get_hw_info(lshw_xml)
@@ -381,22 +428,25 @@ class CephCluster(object):
 
             for adapter, ips_with_sizes in info.items():
                 for ip, sz in ips_with_sizes:
-                    if ip in self.public_net:
+                    if self.public_net is not None and ip in self.public_net:
                         host.public_net = HostNetworkInfo(adapter, ip)
 
-                    if ip in self.cluster_net:
+                    if self.cluster_net is not None and ip in self.cluster_net:
                         host.cluster_net = HostNetworkInfo(adapter, ip)
 
             net_stats = self.get_node_net_stats(host.name)
             for net in (host.cluster_net, host.public_net):
-                if net.adapter is not None:
+                if net is not None and net.adapter is not None:
                     net.perf_stats = net_stats.get(net.adapter)
 
             host.uptime = float(stor_node.get('uptime').split()[0])
 
-    def get_perf_stats(self, host_name):
+    def get_rusage_stats(self, host_name):
         stats = collections.defaultdict(lambda: [])
-        host_stats = self.storage.get("perf_stats/" + host_name, expected_format=None)
+        host_stats = self.storage.get("rusage/" + host_name, expected_format=None)
+        if host_stats is None:
+            return {}
+
         for stat_name in host_stats:
             collect_time, stat_type = stat_name.split("-")
 
@@ -413,3 +463,30 @@ class CephCluster(object):
             stat_list.sort()
 
         return stats
+
+    def get_perf_monitoring(self, host_name):
+        path = "perf_monitoring/" + host_name + '/'
+
+        res = {}
+
+        for name, fields, skip in [('io', diskstat_fields[3:], 2),
+                                   ('net', netstat_fields, 0)]:
+            stats_s = self.storage.get(path + name)
+            if stats_s is not None:
+                res[name] = load_performance_log_file(stats_s, fields, skip)
+
+        def to_seconds(val):
+            if '-' in val:
+                days, rest = val.split('-')
+            else:
+                days, rest = 0, val
+
+            h, m, s = map(int, rest.split(":"))
+            return int(days) * 24 * 3600 + h * 3600 + m * 60 + s
+
+        stats_s = self.storage.get(path + 'cpu')
+        if stats_s is not None:
+            res['cpu'] = load_performance_log_file(stats_s, ['pid', 'cpu'], 0,
+                                                   [to_seconds])
+
+        return res

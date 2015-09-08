@@ -1,15 +1,11 @@
-templ = """
-<!DOCTYPE html>
-<meta charset="utf-8">
-<style>
+# body {
+#   font-family: "Helvetica Neue", Helvetica, sans-serif;
+#   margin: 30px auto;
+#   width: 1280px;
+#   position: relative;
+# }
 
-body {
-  font-family: "Helvetica Neue", Helvetica, sans-serif;
-  margin: 30px auto;
-  width: 1280px;
-  position: relative;
-}
-
+css = """
 header {
   padding: 6px 0;
 }
@@ -99,13 +95,18 @@ header {
   background: #000;
   z-index: 2;
 }
+"""
 
-</style>
-<script src="http://d3js.org/d3.v2.js?2.9.1"></script>
-<script src="http://square.github.com/cubism/cubism.v1.js?1.0.0"></script>
-<body id="demo">
+scripts = [
+  'http://d3js.org/d3.v2.js?2.9.1',
+  'http://square.github.com/cubism/cubism.v1.js?1.0.0'
+]
+
+
+# <body id="demo">
+
+body_script = """
 <script>
-
 var context = cubism.context()
     //.serverDelay(new Date(2012, 4, 2) - Date.now())
     //.step(864e5)
@@ -113,18 +114,18 @@ var context = cubism.context()
     .size(3600)
     .stop();
 
-d3.select("#demo").selectAll(".axis")
+d3.select("#__id__").selectAll(".axis")
     .data(["top", "bottom"])
   .enter().append("div")
     .attr("class", function(d) { return d + " axis"; })
     .each(function(d) { d3.select(this).call(context.axis().ticks(12).orient(d)); });
 
-d3.select("body").append("div")
+d3.select("#__id__").append("div")
     .attr("class", "rule")
     .call(context.rule());
 
-d3.select("body").selectAll(".horizon")
-    .data([{{devs}}].map(osd_data))
+d3.select("#__id__").selectAll(".horizon")
+    .data([__devs__].map(osd_data))
     .enter().insert("div", ".bottom")
     .attr("class", "horizon")
     .call(context
@@ -140,7 +141,7 @@ context.on("focus", function(i) {
 function osd_data(name) {
     function os_data_stor(start, stop, step, callback) {
         data = {
-            {{data}}
+            __data__
         };
         callback(null, data[name])
     }

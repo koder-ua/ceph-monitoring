@@ -10,6 +10,7 @@ import collections
 import html
 
 from hw_info import b2ssize
+import ceph_report_template
 from cluster import CephCluster
 from storage import RawResultStorage, JResultStorage
 
@@ -357,13 +358,13 @@ def show_osd_perf_info(report, cluster):
                                    "D write<br>Bps",
                                    "D read<br>IOOps",
                                    "D write<br>IOOps",
-                                   "D IO time %",
+                                   "D IO<br>time %",
                                    "J dev",
                                    "J read<br>Bps",
                                    "J write<br>Bps",
                                    "J read<br>IOOps",
                                    "J write<br>IOOps",
-                                   "J IO time %",
+                                   "J IO<br>time %",
                                    ])
 
     for osd in cluster.osds:
@@ -377,27 +378,25 @@ def show_osd_perf_info(report, cluster):
         host = cluster.hosts[osd.host]
         perf_info = []
 
-        if 'disk' in host.curr_perf_stats:
-            start_time, start_data = host.curr_perf_stats['disk'][0]
-            end_time, end_data = host.curr_perf_stats['disk'][-1]
-            dtime = end_time - start_time
+        if 'disk' in host.rusage_stats:
+            start_time, start_data = host.rusage_stats['disk'][0]
+            dtime = host.uptime
 
             for dev_stat in (osd.data_stor_stats, osd.j_stor_stats):
                 if dev_stat is None:
                     perf_info.extend(['No data'] * 6)
                     continue
 
-                dev = os.path.basename(osd.data_stor_stats['root_dev'])
+                dev = os.path.basename(dev_stat['root_dev'])
                 perf_info.append(dev)
 
                 sd = start_data[dev]
-                ed = end_data[dev]
 
-                perf_info.append(b2ssize(float(ed.sectors_read - sd.sectors_read) * 512 / dtime, False))
-                perf_info.append(b2ssize(float(ed.sectors_written - sd.sectors_written) * 512 / dtime, False))
-                perf_info.append(b2ssize(int(ed.reads_completed - sd.reads_completed) / dtime, False))
-                perf_info.append(b2ssize(int(ed.writes_completed - sd.writes_completed) / dtime, False))
-                perf_info.append(int(0.1 * (ed.io_time - sd.io_time) / dtime))
+                perf_info.append(b2ssize(float(sd.sectors_read) * 512 / dtime, False))
+                perf_info.append(b2ssize(float(sd.sectors_written) * 512 / dtime, False))
+                perf_info.append(b2ssize(int(sd.reads_completed) / dtime, False))
+                perf_info.append(b2ssize(int(sd.writes_completed) / dtime, False))
+                perf_info.append(int(0.1 * sd.io_time / dtime))
         else:
             perf_info.extend(['No data'] * 12)
 
@@ -408,7 +407,67 @@ def show_osd_perf_info(report, cluster):
                  apply_latency_ms,
                  commit_latency_ms] + perf_info))
 
-    report.divs.append("<center><H3>OSD's performance info:</H3><br>\n" + str(table) + "</center>")
+    report.divs.append("<center><H3>OSD's load uptime average:</H3><br>\n" + str(table) + "</center>")
+
+    table = html.Table(header_row=["OSD",
+                                   "node",
+                                   "D dev",
+                                   "D read<br>Bps",
+                                   "D write<br>Bps",
+                                   "D read<br>IOOps",
+                                   "D write<br>IOOps",
+                                   "D IO<br>time %",
+                                   "J dev",
+                                   "J read<br>Bps",
+                                   "J write<br>Bps",
+                                   "J read<br>IOOps",
+                                   "J write<br>IOOps",
+                                   "J IO<br>time %",
+                                   ])
+
+    for osd in cluster.osds:
+
+        host = cluster.hosts[osd.host]
+        perf_m = host.perf_monitoring
+        perf_info = []
+
+        if 'disk' in host.rusage_stats:
+            start_time, start_data = host.rusage_stats['disk'][0]
+            end_time, end_data = host.rusage_stats['disk'][-1]
+            rusage_dtime = end_time - start_time
+        else:
+            dtime = end_data = start_data = None
+
+        for dev_stat in (osd.data_stor_stats, osd.j_stor_stats):
+            if dev_stat is None:
+                perf_info.extend(['No data'] * 6)
+                continue
+            dev = os.path.basename(dev_stat['root_dev'])
+
+            if perf_m is not None and dev in perf_m['io']:
+                sd = perf_m['io'][dev].values[0]
+                ed = perf_m['io'][dev].values[-1]
+                dtime = len(perf_m['io'][dev].values) - 1
+            elif start_data is not None:
+                dtime = rusage_dtime
+                sd = start_data[dev]
+                ed = end_data[dev]
+            else:
+                perf_info.extend(['No data'] * 6)
+                continue
+
+            perf_info.append(dev)
+
+            perf_info.append(b2ssize(float(ed.sectors_read - sd.sectors_read) * 512 / dtime, False))
+            perf_info.append(b2ssize(float(ed.sectors_written - sd.sectors_written) * 512 / dtime, False))
+            perf_info.append(b2ssize(float(ed.reads_completed - sd.reads_completed) / dtime, False))
+            perf_info.append(b2ssize(float(ed.writes_completed - sd.writes_completed) / dtime, False))
+            perf_info.append(int(0.1 * (ed.io_time - sd.io_time) / dtime))
+
+        table.rows.append(map(str, [osd.id, osd.host] + perf_info))
+
+    report.next_line()
+    report.divs.append("<center><H3>OSD's load current:</H3><br>\n" + str(table) + "</center>")
 
 
 def show_hosts_stats(report, cluster):
@@ -429,7 +488,7 @@ def show_hosts_stats(report, cluster):
         host_info = [host.name, "<br>".join(services)]
 
         if host.hw_info is None:
-            table.rows.append(host_info + ['-'] * (header_row - len(host_info)))
+            table.rows.append(host_info + ['-'] * (len(header_row) - len(host_info)))
             continue
 
         if host.hw_info.cores == []:
@@ -454,16 +513,21 @@ def show_hosts_perf_stats(report, cluster):
                   "Public net<br>uptime average<br>send/recv Bps<br>send/recv pps",
                   "Public net<br>current<br>send/recv Bps<br>send/recv pps",
                   "Load avg<br>5 min"]
+
     table = html.Table(header_row=header_row)
     for host in sorted(cluster.hosts.values(), key=lambda x: x.name):
         perf_info = [host.name]
+        perf_m = host.perf_monitoring
+
         for net in (host.cluster_net, host.public_net):
             if net is None:
                 perf_info.append("No data")
                 perf_info.append("No data")
+                perf_info.append("No data")
             else:
                 dev_ip = "{0}<br>{1}".format(net.adapter, net.ip)
-                if net.adapter not in host.hw_info.net_info:
+
+                if host.hw_info is None or net.adapter not in host.hw_info.net_info:
                     settings = "No data"
                 else:
                     speed, dtype, _ = host.hw_info.net_info[net.adapter]
@@ -478,28 +542,120 @@ def show_hosts_perf_stats(report, cluster):
                     b2ssize(float(net.perf_stats.rpackets) / host.uptime, False)
                 ))
 
-                if 'net' in host.curr_perf_stats:
-                    start_time, start_data = host.curr_perf_stats['net'][0]
-                    end_time, end_data = host.curr_perf_stats['net'][-1]
+                if perf_m is not None and net.adapter in perf_m['net']:
+                    sd = perf_m['net'][net.adapter][0]
+                    ed = perf_m['net'][net.adapter][-1]
+                    dtime = len(perf_m['net'][net.adapter]) - 1
+                elif host.rusage_stats is not None and 'net' in host.rusage_stats:
+                    start_time, start_data = host.rusage_stats['net'][0]
+                    end_time, end_data = host.rusage_stats['net'][-1]
                     dtime = end_time - start_time
 
                     sd = start_data[net.adapter]
                     ed = end_data[net.adapter]
+                else:
+                    sd = ed = dtime = None
 
+                if sd is not None:
                     perf_info.append("{0} / {1}<br>{2} / {3}".format(
                         b2ssize(float(ed.sbytes - sd.sbytes) / dtime, False),
                         b2ssize(float(ed.rbytes - sd.rbytes) / dtime, False),
                         b2ssize(float(ed.spackets - sd.spackets) / dtime, False),
                         b2ssize(float(ed.rpackets - sd.rpackets) / dtime, False),
                     ))
-
                 else:
                     perf_info.append('No data')
 
         perf_info.append(host.load_5m)
         table.rows.append(map(str, perf_info))
 
-    report.divs.append("<center><H3>Host's perf info:</H3><br>\n" + str(table) + "</center>")
+    report.divs.append("<center><H3>Host's resource usage:</H3><br>\n" + str(table) + "</center>")
+
+
+def draw_resource_usage(report, cluster):
+    report.style.append(ceph_report_template.css)
+    report.style.append(
+        ".usage {width: 700px; height: 600px; border: 1px solid lightgray;}"
+    )
+
+    report.script_links.extend(ceph_report_template.scripts)
+
+    script = ceph_report_template.body_script
+
+    writes_per_dev = {}
+    reads_per_dev = {}
+
+    for osd in cluster.osds:
+
+        perf_m = cluster.hosts[osd.host].perf_monitoring
+        if perf_m is None:
+            continue
+
+        for tp, dev_stat in (('data', osd.data_stor_stats),
+                             ('journal', osd.j_stor_stats)):
+            if dev_stat is None:
+                continue
+
+            dev = os.path.basename(dev_stat['root_dev'])
+            if dev not in perf_m['io']:
+                continue
+
+            prev_val = perf_m['io'][dev].values[0]
+            writes = []
+            reads = []
+            for val in perf_m['io'][dev].values[1:]:
+                writes.append(val.writes_completed - prev_val.writes_completed)
+                reads.append(val.reads_completed - prev_val.reads_completed)
+                prev_val = val
+
+            dev_uuid = "osd-{0}.{1}".format(osd.id, tp)
+            writes_per_dev[dev_uuid] = ','.join(map(str, writes))
+            reads_per_dev[dev_uuid] = ','.join(map(str, reads))
+
+    wdata_param = [
+        '{0!r}: [{1}]'.format(str(dname), vals)
+        for dname, vals in sorted(writes_per_dev.items())
+    ]
+    wall_devs = map(repr,
+                    map(str,
+                        sorted(writes_per_dev.keys())))
+
+    div_id = 'io_w_usage'
+
+    report.divs.append(
+        '<center><H3>Disk writes:</H3></center><br>' +
+        '<div id="' + div_id + '" class="usage" ></div><br>'
+    )
+
+    report.divs.append(
+        script
+        .replace('__id__', div_id)
+        .replace('__devs__', ", ".join(wall_devs))
+        .replace('__data__', ",".join(wdata_param))
+    )
+
+    rdata_param = [
+        '{0!r}: [{1}]'.format(str(dname), vals)
+        for dname, vals in sorted(reads_per_dev.items())
+    ]
+
+    rall_devs = map(repr,
+                    map(str,
+                        sorted(reads_per_dev.keys())))
+
+    div_id = 'io_r_usage'
+
+    report.divs.append(
+        '<br><center><H3>Disk reads:</H3></center><br>' +
+        '<div id="' + div_id + '" class="usage" ></div><br>'
+    )
+
+    report.divs.append(
+        script
+        .replace('__id__', div_id)
+        .replace('__devs__', ", ".join(rall_devs))
+        .replace('__data__', ",".join(rdata_param))
+    )
 
 
 def show_osd_pool_PG_distribution_html(report, cluster):
@@ -539,7 +695,6 @@ visjs_script = """
 """
 
 visjs_css = """
-body {font: 10pt sans;}
 .graph {width: 500px;height: 500px;border: 1px solid lightgray;}
 """
 
@@ -692,13 +847,12 @@ def main(argv):
         cluster.load()
 
         report = Report(opts.report_name)
+        report.style.append('body {font: 10pt sans;}')
 
         show_summary(report, cluster)
         report.next_line()
 
         show_osd_pool_PG_distribution_html(report, cluster)
-        report.next_line()
-
         show_osd_info(report, cluster)
         report.next_line()
 
@@ -718,6 +872,10 @@ def main(argv):
         report.next_line()
 
         tree_to_visjs(report, cluster)
+        report.next_line()
+
+        draw_resource_usage(report, cluster)
+        report.next_line()
 
         if opts.out == '-':
             sys.stdout.write(str(report))

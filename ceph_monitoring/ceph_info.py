@@ -8,55 +8,85 @@ import texttable
 from ceph_report_templ import templ
 
 
-class DevLoad(object):
-    def __init__(self, name):
+class DevLoadLog(object):
+    def __init__(self, name, start_timstamp):
         self.name = name
         self.values = collections.defaultdict(lambda: [])
-        self.is_partition = name[-1].isdigit()
+        self.start_timstamp = start_timstamp
 
-    def get_dev(self):
-        name = self.name
-        while name[-1].isdigit():
-            name = name[:-1]
-        return name
+    def update(self, key, value):
+        self.values[key].append(value)
 
     def get_avg_sz(self):
         return self.sum_data() / self.sum_iops()
 
-    def sum_data(self):
-        return sum(map(float, self.values['wkB/s']))
 
-    def sum_iops(self):
-        return sum(map(float, self.values['w/s']))
+def load_performance_log_file(str_data, fields):
+    # first line - collection start time
+    lines = iter(str_data.split("\n"))
 
+    # Mon Sep  7 21:08:26 UTC 2015
+    sdate = datetime.datetime.strptime(next(lines), "%a %b %d %H:%M:%S %z %Y")
+    utc_naive = sdate.replace(tzinfo=None) - sdate.utcoffset()
+    timestamp = (utc_naive - datetime(1970, 1, 1)).total_seconds()
 
-def load_io_usage(fname):
-    fc = [i.strip()
-          for i in open(fname).read().split("\n")
-          if i.strip() != ""]
-
-    devs = fc[0].split()
-    num_devs = len(fc[1].split())
-    fc = fc[2:]
-    pairs = zip(devs[::2], devs[1::2])
     per_dev = {}
-    names = ('rrqm/s wrqm/s r/s w/s' +
-             ' rkB/s wkB/s avgrq-sz avgqu-sz' +
-             ' await r_await w_awaits vctm util').split()
 
-    for offset in range(len(fc) / num_devs):
-        data = fc[offset * num_devs:(offset + 1) * num_devs]
+    for line in lines:
+        line = line.strip()
+        if line == '':
+            continue
+
+        items = line.split()
+        dev = items[0]
+
+        if dev not in per_dev:
+            per_dev[dev] = obj = DevLoadLog(dev, timestamp)
+        else:
+            obj = per_dev[items[0]]
+
+        for metr_name, val in zip(fields, map(float, items[1:])):
+            obj.append(metr_name, val)
+
+    return per_dev
+
+
+io_log_fields = ('rrqm/s wrqm/s r/s w/s' +
+                 ' rkB/s wkB/s avgrq-sz avgqu-sz' +
+                 ' await r_await w_awaits vctm util').split()
+
+net_log_fields = ('rrqm/s wrqm/s r/s w/s' +
+                  ' rkB/s wkB/s avgrq-sz avgqu-sz' +
+                  ' await r_await w_awaits vctm util').split()
+
+def load_net_usage(str_data):
+    # first line - collection start time
+    lines = iter(str_data)
+    timestamp = perf_log_time2ts(next(lines))
+    devs = next(lines).split()
+    num_devs = len(devs)
+
+    data = [map(float, line.strip().split()) for line in lines if line.strip() != ""]
+
+    per_dev = {}
+    names = ('recv', 'send')
+
+    assert len(data) % num_devs == 0
+
+    for offset in range(0, len(data), num_devs):
+        data = data[offset:offset + num_devs]
         for line in data:
             items = line.split()
-            if items[0] not in per_dev:
-                obj = DevLoad(items[0])
-                per_dev[items[0]] = obj
+            dev = items[0]
+            if dev not in per_dev:
+                per_dev[dev] = obj = DevLoad(dev, timestamp)
             else:
                 obj = per_dev[items[0]]
 
             for metr_name, val in zip(names, map(float, items[1:])):
-                obj.values[metr_name].append(val)
-    return pairs, per_dev
+                obj.append(metr_name, val)
+
+    return data_journal_pairs, per_dev
 
 
 class Host(object):
@@ -126,26 +156,26 @@ for host in hosts.values():
     host.devs_pairs, host.io_usage = load_io_usage(host.files['io'])
     host.agg_partitions()
 
-tab = texttable.Texttable(max_width=120)
-tab.set_deco(tab.HEADER | tab.VLINES | tab.BORDER)
-tab.set_cols_align(['r', 'r', 'r', 'r', 'r'])
-tab.header(['host::dev', 'avg_sz', 'wr Mb', 'wr kIO', 'avg util %'])
+# tab = texttable.Texttable(max_width=120)
+# tab.set_deco(tab.HEADER | tab.VLINES | tab.BORDER)
+# tab.set_cols_align(['r', 'r', 'r', 'r', 'r'])
+# tab.header(['host::dev', 'avg_sz', 'wr Mb', 'wr kIO', 'avg util %'])
 
 hosts_list = sorted(hosts.values(), key=lambda x: x.name)
-for host in hosts_list:
-    for dev_name in sorted(host.pure_dev_names):
-        dev = host.io_usage[dev_name]
-        tab.add_row([
-            host.name + "::" + dev_name,
-            int(dev.get_avg_sz()),
-            int(dev.sum_data() / 1024),
-            int(dev.sum_iops() / 1000),
-            int(sum(dev.values['util']) / len(dev.values['util']))])
-    if host != hosts_list[-1]:
-        tab.add_row(['----'] * 5)
+# for host in hosts_list:
+#     for dev_name in sorted(host.pure_dev_names):
+#         dev = host.io_usage[dev_name]
+#         tab.add_row([
+#             host.name + "::" + dev_name,
+#             int(dev.get_avg_sz()),
+#             int(dev.sum_data() / 1024),
+#             int(dev.sum_iops() / 1000),
+#             int(sum(dev.values['util']) / len(dev.values['util']))])
+#     if host != hosts_list[-1]:
+#         tab.add_row(['----'] * 5)
 
-print tab.draw()
-exit(1)
+# print tab.draw()
+# exit(1)
 
 for host in hosts_list:
     for dev_name in sorted(host.pure_dev_names):

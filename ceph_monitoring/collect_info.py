@@ -2,6 +2,7 @@ import re
 import sys
 import time
 import json
+import uuid
 import Queue
 import shutil
 import logging
@@ -43,10 +44,12 @@ def check_output(cmd, log=True):
     return code == 0, out[0]
 
 
+SSH_OPTS = "-o LogLevel=quiet -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+
+
 def check_output_ssh(host, opts, cmd):
     logger.debug("SSH:%s: %r", host, cmd)
-    ssh_opts = "-o LogLevel=quiet -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
-    return check_output("ssh {2} {0} {1}".format(host, cmd, ssh_opts), False)
+    return check_output("ssh {2} {0} {1}".format(host, cmd, SSH_OPTS), False)
 
 
 def get_device_for_file(host, opts, fname):
@@ -120,6 +123,9 @@ class CephDataCollector(Collector):
         Collector.__init__(self, *args, **kwargs)
         self.ceph_cmd = "ceph -c {0.conf} -k {0.key} --format json ".format(self.opts)
 
+        self.osd_devs = {}
+        self.osd_devs_lock = threading.Lock()
+
     def collect_master(self, path=None, node=None):
         path = path + "/master/"
 
@@ -189,7 +195,7 @@ class CephDataCollector(Collector):
                               'used': used,
                               'avail': avail,
                               'is_ssd': is_ssd}))
-        return dev
+        return root_dev
 
     def collect_osd(self, path, host, osd_id):
         path = "{0}/osd/{1}/".format(path, osd_id)
@@ -218,16 +224,34 @@ class CephDataCollector(Collector):
 
             osd_cfg = json.loads(data)
 
-            data_dev = str(osd_cfg['osd_journal'])
-            jdev = str(osd_cfg['osd_data'])
+            data_dev = osd_cfg.get('osd_data')
+            jdev = osd_cfg.get('osd_journal')
+
+            if data_dev is not None:
+                data_dev = str(data_dev)
+
+            if jdev is not None:
+                jdev = str(jdev)
+
         else:
+            data_dev = None
+            jdev = None
+
+        if not osd_running:
             logger.warning("osd-{0} in node {1} is down.".format(osd_id, host) +
                            " No config available, will use default data and journal path")
+
+        if data_dev is None:
             data_dev = "/var/lib/ceph/osd/ceph-{0}".format(osd_id)
+
+        if jdev is None:
             jdev = "/var/lib/ceph/osd/ceph-{0}/journal".format(osd_id)
 
-        self.emit_device_info(host, path + "journal", data_dev)
-        self.emit_device_info(host, path + "data", jdev)
+        data_root_dev = self.emit_device_info(host, path + "data", data_dev)
+        jroot_dev = self.emit_device_info(host, path + "journal", jdev)
+
+        with self.osd_devs_lock:
+            self.osd_devs[osd_id] = (host, data_root_dev, jroot_dev)
 
     def collect_monitor(self, path, host, name):
         path = "{0}/mon/{1}/".format(path, host)
@@ -276,53 +300,126 @@ class NodeCollector(Collector):
             self.ssh2emit(host, path + path_off, frmt, cmd)
 
 
-class NodePerformanceCollector(Collector):
-    name = 'performance'
-    run_alone = True
-
-    def collect_node(self, path, host):
-        path = '{0}/hosts/{1}/'.format(path, host)
-        self.ssh2emit(host, path + "vmstat", "txt",
-                      "vmstat 1 {0}".format(self.opts.stat_collect_seconds))
-        self.ssh2emit(host, path + "iostat", "txt",
-                      "iostat -x 1 {0}".format(self.opts.stat_collect_seconds))
-        self.ssh2emit(host, path + "top", "txt",
-                      "top -b -d {0} -n 10".format(self.opts.stat_collect_seconds))
-
-
 class NodeResourseUsageCollector(Collector):
     name = 'resource'
     run_alone = True
 
     def collect_node(self, path, host):
-        cpath = '{0}/perf_stats/{1}/{2}-disk'.format(path, host, int(time.time()))
+        cpath = '{0}/rusage/{1}/{2}-disk'.format(path, host, int(time.time()))
         self.ssh2emit(host, cpath, "txt", "cat /proc/diskstats")
 
-        cpath = '{0}/perf_stats/{1}/{2}-net'.format(path, host, int(time.time()))
+        cpath = '{0}/rusage/{1}/{2}-net'.format(path, host, int(time.time()))
         self.ssh2emit(host, cpath, "txt", "cat /proc/net/dev")
 
 
-# class CephPerformanceCollector(Collector):
-#     name = 'ceph_performance'
-#     run_alone = True
+performance_monitor_code_templ = """#!/bin/bash
+function monitor_ceph_io() {
+    date
+    for i in $(seq __runtime__) ; do
+        grep -E '__devs_grep_pattern__' /proc/diskstats
+        sleep 1
+    done
+}
 
-#     def collect_osd(self, path, host, osd_id):
-#         path = '{0}/osd/{1}/'.format(path, osd_id)
+function monitor_ceph_cpu() {
+    date
+    for i in $(seq __runtime__) ; do
+        ps -p __osd_pids__ -o pid,cputime | grep -v PID
+        sleep 1
+    done
+}
 
-#         osd_cfg_cmd = "sudo ceph -f json --admin-daemon /var/run/ceph/ceph-osd.{0}.asok config show"
-#         ok, data = check_output_ssh(host, self.opts, osd_cfg_cmd.format(osd_id))
-#         assert ok
-#         osd_cfg = json.loads(data)
+function monitor_ceph_net() {
+    date
+    for i in $(seq __runtime__) ; do
+        grep -E '__net_grep_pattern__' /proc/net/dev | tr -d ':'
+        sleep 1
+    done
+}
 
-#         j_root_dev, j_dev = get_device_for_file(host, self.opts, str(osd_cfg['osd_journal']))
-#         d_root_dev, d_dev = get_device_for_file(host, self.opts, str(osd_cfg['osd_data']))
+monitor_ceph_io > __io_file__ &
+monitor_ceph_cpu > __cpu_file__ &
+monitor_ceph_net > __net_file__
 
-#         self.ssh2emit(host, path + "vmstat", "txt",
-#                       "vmstat 1 {0}".format(self.opts.stat_collect_seconds))
-#         self.ssh2emit(host, path + "iostat", "txt",
-#                       "iostat -x 1 {0}".format(self.opts.stat_collect_seconds))
-#         self.ssh2emit(host, path + "top", "txt",
-#                       "top -b -d {0} -n 10".format(self.opts.stat_collect_seconds))
+wait
+"""
+
+
+class CephPerformanceCollector(Collector):
+    name = 'performance'
+
+    def __init__(self, *args, **kwargs):
+        super(CephPerformanceCollector, self).__init__(*args, **kwargs)
+        self.run_uuid = str(uuid.uuid1())
+        self.io_file = "/tmp/io_{0}.txt".format(self.run_uuid)
+        self.cpu_file = "/tmp/cpu_{0}.txt".format(self.run_uuid)
+        self.net_file = "/tmp/net_{0}.txt".format(self.run_uuid)
+        self.remote_file = "/tmp/{0}.sh".format(self.run_uuid)
+
+    def start_performance_monitoring(self, path, host, osd_devs):
+        local_file = "/tmp/{0}_{1}.sh".format(host, self.run_uuid)
+
+        osd_devs = map(os.path.basename, osd_devs)
+        uniq_devs = " ".join(set(osd_devs))
+        grep_re = "|".join(map("\\b{0}\\b".format, set(osd_devs)))
+
+        ok, osd_pids = check_output_ssh(host, self.opts, "ps aux")
+        assert ok
+        osd_pid_list = []
+        for process in osd_pids.strip().split("\n"):
+            vals = process.split()
+            if 'ceph-osd' in vals[10]:
+                osd_pid_list.append(vals[1])
+
+        ok, net_devs = check_output_ssh(host, self.opts, 'ls -l /sys/class/net')
+        assert ok
+
+        all_devs = []
+        phy_devs = []
+
+        for line in net_devs.strip().split("\n")[1:]:
+            dev = line.split()[8]
+            all_devs.append(dev)
+
+            if 'devices/pci' in line.split()[10]:
+                phy_devs.append(dev)
+
+        all_devs_re = "|".join(map("\\b{0}\\b".format, all_devs))
+
+        performance_monitor_code = performance_monitor_code_templ \
+            .replace('__runtime__', str(self.opts.performance_collect_seconds)) \
+            .replace('__io_file__', self.io_file) \
+            .replace('__net_file__', self.net_file) \
+            .replace('__cpu_file__', self.cpu_file) \
+            .replace('__uniq_osd_devs__', uniq_devs) \
+            .replace('__devs_grep_pattern__', grep_re) \
+            .replace('__osd_pids__', ",".join(osd_pid_list)) \
+            .replace('__net_grep_pattern__', all_devs_re)
+
+        open(local_file, "w").write(performance_monitor_code)
+        try:
+            scp_cmd = "scp {0} {1} {2}:{3}".format(SSH_OPTS, local_file,
+                                                   host, self.remote_file)
+
+            ok, _ = check_output(scp_cmd)
+            assert ok
+        finally:
+            os.unlink(local_file)
+
+        start_cmd = 'screen -S ceph_monitor -d -m bash ' + self.remote_file
+        check_output_ssh(host, self.opts, start_cmd)
+
+    def collect_performance_data(self, path, host):
+        all_files = {'io': self.io_file,
+                     'cpu': self.cpu_file,
+                     'net': self.net_file}
+
+        for tp, fname in all_files.items():
+            self.ssh2emit(host,
+                          "{0}/perf_monitoring/{1}/{2}".format(path, host, tp),
+                          "txt", 'cat ' + fname)
+        check_output_ssh(host, self.opts, "rm -f " +
+                         " ".join(all_files.values() + [self.remote_file]))
 
 
 class CephDiscovery(object):
@@ -444,9 +541,8 @@ def setup_loggers(default_level=logging.INFO, log_fname=None):
 ALL_COLLECTORS = [
     CephDataCollector,
     NodeCollector,
-    NodePerformanceCollector,
-    NodeResourseUsageCollector
-    # CephPerformanceCollector
+    NodeResourseUsageCollector,
+    CephPerformanceCollector
 ]
 
 
@@ -483,7 +579,7 @@ def parse_args(argv):
     p.add_argument("--ceph-log-max-lines", default=1000,
                    type=int, help="Max lines from osd/mon log")
 
-    p.add_argument("--collectors", default="ceph,node,resource",
+    p.add_argument("--collectors", default="ceph,node,resource,performance",
                    help="Coma separated list of collectors" +
                    "select from : " +
                    ",".join(coll.name for coll in ALL_COLLECTORS))
@@ -494,7 +590,7 @@ def parse_args(argv):
 
     p.add_argument("-o", "--result", default=None, help="Result file")
 
-    p.add_argument("-f", "--keep-folder", default=False,
+    p.add_argument("-n", "--dont-remove-unpacked", default=False,
                    action="store_true",
                    help="Keep unpacked data")
 
@@ -506,6 +602,16 @@ def parse_args(argv):
 
 
 logger_ready = False
+
+
+def get_sshable_hosts(hosts):
+    cmd = "ssh " + SSH_OPTS + " -o ConnectTimeout=5 -o ConnectionAttempts=1 "
+    good_hosts = []
+    for host in hosts:
+        ok, out = check_output(cmd + host + ' pwd')
+        if ok:
+            good_hosts.append(host)
+    return good_hosts
 
 
 def main(argv):
@@ -533,18 +639,33 @@ def main(argv):
     map(collector_settings.disable, opts.disable)
 
     allowed_collectors = opts.collectors.split(',')
+    collectors = []
 
-    collectors = [
-        collector_class(opts, collector_settings, res_q)
-        for collector_class in ALL_COLLECTORS
-        if collector_class.name in allowed_collectors and
-        NodeResourseUsageCollector.name != collector_class.name
-    ]
+    if CephDataCollector.name in allowed_collectors:
+        ceph_collector = CephDataCollector(opts, collector_settings, res_q)
+        collectors.append(ceph_collector)
+    else:
+        ceph_collector = None
+
+    if NodeCollector.name in allowed_collectors:
+        node_collector = NodeCollector(opts, collector_settings, res_q)
+        collectors.append(node_collector)
+    else:
+        node_collector = None
 
     if NodeResourseUsageCollector.name in allowed_collectors:
-        nruc = NodeResourseUsageCollector(opts, collector_settings, res_q)
+        node_resource_collector = NodeResourseUsageCollector(opts, collector_settings, res_q)
     else:
-        nruc = None
+        node_resource_collector = None
+
+    if CephPerformanceCollector.name in allowed_collectors:
+        if CephDataCollector.name not in allowed_collectors:
+            logger.error("Can't collect performance info without ceph info collected")
+            exit(1)
+        else:
+            ceph_performance_collector = CephPerformanceCollector(opts, collector_settings, res_q)
+    else:
+        ceph_performance_collector = None
 
     nodes = discover_nodes(opts)
     nodes['master'][None] = [{}]
@@ -558,10 +679,31 @@ def main(argv):
 
     logger.info("Found %s hosts total", len(nodes['node']))
 
+    good_hosts = set(get_sshable_hosts(nodes['node'].keys()))
+    bad_hosts = set(nodes['node'].keys()) - good_hosts
+
+    if len(bad_hosts) != 0:
+        logger.warning("Next hosts aren't awailable over ssh and would be skipped: %s",
+                       ",".join(bad_hosts))
+
+    res_q.put((True, "bad_hosts", 'json', json.dumps(list(bad_hosts))))
+
+    new_nodes = collections.defaultdict(lambda: {})
+
+    for role, role_objs in nodes.items():
+        if role == 'master':
+            new_nodes[role] = role_objs
+        else:
+            for node, args in role_objs.items():
+                if node in good_hosts:
+                    new_nodes[role][node] = args
+
+    nodes = new_nodes
+
     # collect data at the beginning
-    if nruc is not None:
+    if node_resource_collector is not None:
         for node, _ in nodes['node'].items():
-            run_q.put((nruc.collect_node, "", node, {}))
+            run_q.put((node_resource_collector.collect_node, "", node, {}))
 
     for role, nodes_with_args in nodes.items():
         for collector in collectors:
@@ -580,7 +722,7 @@ def main(argv):
     run_all(opts, run_q)
 
     # collect data at the end
-    if nruc is not None:
+    if node_resource_collector is not None:
         dt = opts.usage_collect_interval - (time.time() - t1)
         if dt > 0:
             logger.info("Will wait for {0} seconds for usage collection".format(int(dt)))
@@ -588,10 +730,37 @@ def main(argv):
                 time.sleep(0.1)
         logger.info("Start final usage collection")
         for node, _ in nodes['node'].items():
-            run_q.put((nruc.collect_node, "", node, {}))
+            run_q.put((node_resource_collector.collect_node, "", node, {}))
+        run_all(opts, run_q)
+
+    if ceph_performance_collector is not None:
+        logger.info("Start performace monitoring.")
+        with ceph_collector.osd_devs_lock:
+            osd_devs = ceph_collector.osd_devs.copy()
+
+        per_node = collections.defaultdict(lambda: [])
+        for node, data_dev, j_dev in osd_devs.values():
+            per_node[node].extend((data_dev, j_dev))
+
+        # start monitoring
+        for node, data in per_node.items():
+            run_q.put((ceph_performance_collector.start_performance_monitoring,
+                      "", node, {'osd_devs': data}))
+        run_all(opts, run_q)
+
+        dt = opts.performance_collect_seconds
+        logger.info("Will wait for {0} seconds for performance collection".format(int(dt)))
+        for i in range(int(dt / 0.1)):
+            time.sleep(0.1)
+
+        # collect results
+        for node, data in per_node.items():
+            run_q.put((ceph_performance_collector.collect_performance_data,
+                      "", node, {}))
         run_all(opts, run_q)
 
     res_q.put(None)
+    # wait till all data collected
     save_results_thread.join()
 
     if opts.result is None:
@@ -604,7 +773,7 @@ def main(argv):
     check_output("cd {0} ; tar -zcvf {1} *".format(out_folder, out_file))
     logger.info("Result saved into %r", out_file)
 
-    if opts.keep_folder:
+    if not opts.dont_remove_unpacked:
         shutil.rmtree(out_folder)
     else:
         logger.info("Temporary folder %r", out_folder)

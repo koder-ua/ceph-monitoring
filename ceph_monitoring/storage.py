@@ -61,9 +61,14 @@ class RawResultStorage(object):
         return data[rest]
 
     def get(self, path, default=None, expected_format='txt'):
-        ok, frmt, data = self[path]
+        try:
+            ok, frmt, data = self[path]
+        except AttributeError:
+            return default
+
         if not ok or frmt != expected_format:
             return default
+
         return data
 
     def __len__(self):
@@ -90,7 +95,10 @@ class JResultStorage(object):
         return res
 
     def get(self, path, default=None, expected_format='json'):
-        return json.loads(self.__storage.get(path, default, expected_format=expected_format))
+        res = self.__storage.get(path, default, expected_format=expected_format)
+        if res is not None:
+            return json.loads(res)
+        return res
 
     def __iter__(self):
         return iter(self.__storage)
