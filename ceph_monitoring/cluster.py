@@ -67,7 +67,17 @@ class Host(object):
 
 
 class TabulaRasa(object):
-    pass
+    def __init__(self, **attrs):
+        self.__dict__.update(attrs)
+
+    def get(self, name, default=None):
+        try:
+            return self.__dict__.get(name, default)
+        except KeyError:
+            raise AttributeError(name)
+
+    def __contains__(self, name):
+        return name in self.__dict__
 
 
 class DevLoadLog(object):
@@ -159,9 +169,7 @@ def load_performance_log_file(str_data, fields, skip=0, field_types=None):
         else:
             obj = per_dev[items[0]]
 
-        tr = TabulaRasa()
-        tr.__dict__.update(zip(fields, fied_tr(items[1:])))
-        obj.values.append(tr)
+        obj.values.append(TabulaRasa(**dict(zip(fields, fied_tr(items[1:])))))
 
     return per_dev
 
@@ -288,7 +296,7 @@ class CephCluster(object):
                 if dev_stat is None:
                     continue
 
-                dev = os.path.basename(dev_stat['root_dev'])
+                dev = os.path.basename(dev_stat.root_dev)
 
                 if perf_m is not None:
                     sd = perf_m[dev].values[0]
@@ -301,20 +309,24 @@ class CephCluster(object):
                 else:
                     continue
 
-                dev_stat['read_bytes_curr'] = (ed.sectors_read - sd.sectors_read) * 512 / dtime
-                dev_stat['write_bytes_curr'] = (ed.sectors_written - sd.sectors_written) * 512 / dtime
-                dev_stat['read_iops_curr'] = (ed.reads_completed - sd.reads_completed) / dtime
-                dev_stat['write_iops_curr'] = (ed.writes_completed - sd.writes_completed) / dtime
-                dev_stat['io_time_curr'] = 0.001 * (ed.io_time - sd.io_time) / dtime
-                dev_stat['w_io_time_curr'] = 0.001 * (ed.weighted_io_time - sd.weighted_io_time) / dtime
+                dev_stat.read_bytes_curr = (ed.sectors_read - sd.sectors_read) * 512 / dtime
+                dev_stat.write_bytes_curr = (ed.sectors_written - sd.sectors_written) * 512 / dtime
+                dev_stat.read_iops_curr = (ed.reads_completed - sd.reads_completed) / dtime
+                dev_stat.write_iops_curr = (ed.writes_completed - sd.writes_completed) / dtime
+                dev_stat.io_time_curr = 0.001 * (ed.io_time - sd.io_time) / dtime
+                dev_stat.w_io_time_curr = 0.001 * (ed.weighted_io_time - sd.weighted_io_time) / dtime
 
-                if sd is not None:
-                    dev_stat['read_bytes_uptime'] = (sd.sectors_read) * 512 / host.uptime
-                    dev_stat['write_bytes_uptime'] = (sd.sectors_written) * 512 / host.uptime
-                    dev_stat['read_iops_uptime'] = sd.reads_completed / host.uptime
-                    dev_stat['write_iops_uptime'] = (sd.writes_completed) / host.uptime
-                    dev_stat['io_time_uptime'] = 0.001 * sd.io_time / host.uptime
-                    dev_stat['w_io_time_uptime'] = 0.001 * sd.weighted_io_time / host.uptime
+                # derived stats
+                dev_stat.iops_curr = dev_stat.read_iops_curr + dev_stat.write_iops_curr
+                dev_stat.queue_depth_curr = dev_stat.w_io_time_curr
+                dev_stat.lat_curr = dev_stat.w_io_time_curr / dev_stat.iops_curr
+
+                dev_stat.read_bytes_uptime = (sd.sectors_read) * 512 / host.uptime
+                dev_stat.write_bytes_uptime = (sd.sectors_written) * 512 / host.uptime
+                dev_stat.read_iops_uptime = sd.reads_completed / host.uptime
+                dev_stat.write_iops_uptime = (sd.writes_completed) / host.uptime
+                dev_stat.io_time_uptime = 0.001 * sd.io_time / host.uptime
+                dev_stat.w_io_time_uptime = 0.001 * sd.weighted_io_time / host.uptime
 
     def load_cluster_networks(self):
         self.cluster_net = None
@@ -375,8 +387,8 @@ class CephCluster(object):
 
             try:
                 osd_data = getattr(self.jstorage.osd, str(node['id']))
-                osd.data_stor_stats = osd_data.data.stats
-                osd.j_stor_stats = osd_data.journal.stats
+                osd.data_stor_stats = TabulaRasa(**osd_data.data.stats)
+                osd.j_stor_stats = TabulaRasa(**osd_data.journal.stats)
             except AttributeError:
                 osd.data_stor_stats = None
                 osd.j_stor_stats = None

@@ -294,17 +294,17 @@ def show_osd_info(report, cluster):
                 color = "green"
             avail_perc_str = '<font color="{0}">{1}</font>'.format(color, avail_perc)
 
-            if osd.data_stor_stats['root_dev'] == osd.j_stor_stats['root_dev']:
+            if osd.data_stor_stats.root_dev == osd.j_stor_stats.root_dev:
                 j_on_same_drive = html_fail("yes")
             else:
                 j_on_same_drive = html_ok("no")
 
-            if osd.data_stor_stats['dev'] != osd.j_stor_stats['dev']:
+            if osd.data_stor_stats.dev != osd.j_stor_stats.dev:
                 j_on_file = html_ok("no")
             else:
                 j_on_file = html_fail("yes")
 
-            if osd.j_stor_stats['is_ssd']:
+            if osd.j_stor_stats.is_ssd:
                 j_on_ssd = html_ok("yes")
             else:
                 j_on_ssd = html_fail("no")
@@ -379,12 +379,12 @@ def show_osd_perf_info(report, cluster):
                 perf_info.extend(['-'] * 6)
                 continue
 
-            perf_info.append(os.path.basename(dev_stat['root_dev']))
-            perf_info.append(b2ssize(dev_stat['read_bytes_uptime'], False))
-            perf_info.append(b2ssize(dev_stat['write_bytes_uptime'], False))
-            perf_info.append(b2ssize(dev_stat['read_iops_uptime'], False))
-            perf_info.append(b2ssize(dev_stat['write_iops_uptime'], False))
-            perf_info.append(int(dev_stat['io_time_uptime']))
+            perf_info.append(os.path.basename(dev_stat.root_dev))
+            perf_info.append(b2ssize(dev_stat.read_bytes_uptime, False))
+            perf_info.append(b2ssize(dev_stat.write_bytes_uptime, False))
+            perf_info.append(b2ssize(dev_stat.read_iops_uptime, False))
+            perf_info.append(b2ssize(dev_stat.write_iops_uptime, False))
+            perf_info.append(int(dev_stat.io_time_uptime))
 
         table.add_row(
             map(str,
@@ -423,12 +423,12 @@ def show_osd_perf_info(report, cluster):
 
             have_data = True
             have_any_data = True
-            perf_info.append(os.path.basename(dev_stat['root_dev']))
-            perf_info.append(b2ssize(dev_stat['read_bytes_curr'], False))
-            perf_info.append(b2ssize(dev_stat['write_bytes_curr'], False))
-            perf_info.append(b2ssize(dev_stat['read_iops_curr'], False))
-            perf_info.append(b2ssize(dev_stat['write_iops_curr'], False))
-            perf_info.append(int(dev_stat['io_time_curr']))
+            perf_info.append(os.path.basename(dev_stat.root_dev))
+            perf_info.append(b2ssize(dev_stat.read_bytes_curr, False))
+            perf_info.append(b2ssize(dev_stat.write_bytes_curr, False))
+            perf_info.append(b2ssize(dev_stat.read_iops_curr, False))
+            perf_info.append(b2ssize(dev_stat.write_iops_curr, False))
+            perf_info.append(int(dev_stat.io_time_curr))
 
         if have_data:
             table.add_row(map(str, [osd.id, osd.host] + perf_info))
@@ -449,7 +449,7 @@ def show_host_network_load_in_color(report, cluster):
 
         nets += [(net.name, net)
                  for net in host.net_adapters.values()
-                 if net.is_phy and host.cluster_net not in ceph_adapters]
+                 if net.is_phy and net.name not in ceph_adapters]
 
         for name, net in nets:
             if net is None or net.perf_stats_curr is None:
@@ -458,7 +458,7 @@ def show_host_network_load_in_color(report, cluster):
             usage = max((net.perf_stats_curr.sbytes,
                          net.perf_stats_curr.rbytes))
 
-            if usage > 0:
+            if usage > 0 or name in ('cluster', 'public'):
                 net_io[host.name][name] = (usage, net.speed)
 
     if len(net_io) == 0:
@@ -474,13 +474,16 @@ def show_host_network_load_in_color(report, cluster):
 
     for host_name, data in sorted(net_io.items()):
         table += "<tr><td>" + host_name + "</td>"
-        for adapter, (usage, speed) in data.items():
+        net_names = ['public', 'cluster'] + sorted(set(data.keys()) - set(['public', 'cluster']))
+
+        for net_name in net_names:
+            usage, speed = data[net_name]
             if speed is None:
                 color = "#FFFFFF"
             else:
-                color = val_to_color(usage / speed)
+                color = val_to_color(float(usage) / speed)
             table += '<td bgcolor="{0}"><b><font color="#303030">{1}: {2}</font></b></td>'\
-                .format(color, adapter, b2ssize(usage, False))
+                .format(color, net_name, b2ssize(usage, False))
         table += '<td />' * (max_len - len(data.items())) + "</tr>"
 
     table += "</table>"
@@ -488,37 +491,45 @@ def show_host_network_load_in_color(report, cluster):
 
 
 def show_host_io_load_in_color(report, cluster):
-    hosts_io_bytes = collections.defaultdict(lambda: {})
-    hosts_io_iops = collections.defaultdict(lambda: {})
-    hosts_io_wtime = collections.defaultdict(lambda: {})
+    bts = collections.defaultdict(lambda: {})
+    iops = collections.defaultdict(lambda: {})
+    queue_depth = collections.defaultdict(lambda: {})
+    lat = collections.defaultdict(lambda: {})
 
     for osd in cluster.osds:
         for dev_stat in (osd.data_stor_stats, osd.j_stor_stats):
             if dev_stat is None or 'write_bytes_curr' not in dev_stat:
                 continue
 
-            dev = os.path.basename(dev_stat['root_dev'])
-            hosts_io_bytes[osd.host][dev] = dev_stat['write_bytes_curr'] + dev_stat['read_bytes_curr']
-            hosts_io_iops[osd.host][dev] = dev_stat['write_iops_curr'] + dev_stat['read_iops_curr']
-            hosts_io_wtime[osd.host][dev] = int(dev_stat['w_io_time_curr'] * 100)
+            dev = os.path.basename(dev_stat.root_dev)
+            bts[osd.host][dev] = dev_stat.write_bytes_curr + dev_stat.read_bytes_curr
+            iops[osd.host][dev] = dev_stat.write_iops_curr + dev_stat.read_iops_curr
+            queue_depth[osd.host][dev] = dev_stat.w_io_time_curr
+            lat[osd.host][dev] = dev_stat.lat_curr * 1000
 
-    if len(hosts_io_bytes) == 0:
+    if len(bts) == 0:
         report.divs.append("<center><H3>No current IO load awailable</H3></center><br>")
         return
 
     loads = [
-        (hosts_io_iops, 1000, 'iops'),
-        (hosts_io_bytes, 1024, 'bps'),
-        (hosts_io_wtime, 1000, 'util %'),
+        (iops, 1000, 'iops', 50),
+        (bts, 1024, 'bps', 200 * 1024),  # 50 IOPS * 4k
+        (queue_depth, None, 'io queue depts', 3),
+        (lat, None, 'lat ms', 20),
     ]
 
-    for target, base, tp in loads:
-        max_val = max(map(max, [data.values() for data in target.values()]))
+    for target, base, tp, min_max_val in loads:
+        if target is lat:
+            max_val = 100.0
+        else:
+            max_val = max(map(max, [data.values() for data in target.values()]))
+            max_val = max(min_max_val, max_val)
+
         max_len = max(map(len, target.values()))
 
         table = '<table cellpadding="4" style="border: 1px solid #000000; border-collapse: collapse;"'
         table += ' border="1"><tr><th>host</th>'
-        table += ('<th>load ' + tp + '</th>') * max_len + "</tr>"
+        table += '<th>load</th>' * max_len + "</tr>"
 
         for host_name, data in sorted(target.items()):
             row = ""
@@ -528,8 +539,15 @@ def show_host_io_load_in_color(report, cluster):
                 else:
                     color = val_to_color(float(val) / max_val)
 
+                if target is lat:
+                    s_val = str(int(val))
+                elif target is queue_depth:
+                    s_val = "%.1f" % (val,)
+                else:
+                    s_val = b2ssize(val, False, base=base)
+
                 row += '<td bgcolor="{0}"><b><font color="#303030">{1} {2}</font></b></td>'.format(
-                    color, dev, b2ssize(val, False, base=base))
+                    color, dev, s_val)
 
             table += "<tr><td>" + host_name + "</td>"
             table += row + '<td />' * (max_len - len(data.items())) + "</tr>"
@@ -661,7 +679,7 @@ def draw_resource_usage(report, cluster):
 
         if osd.data_stor_stats is not None and \
            osd.j_stor_stats is not None and \
-           osd.j_stor_stats['root_dev'] == osd.data_stor_stats['root_dev']:
+           osd.j_stor_stats.root_dev == osd.data_stor_stats.root_dev:
             dev_list = [('data/jornal', osd.data_stor_stats)]
         else:
             dev_list = [('data', osd.data_stor_stats),
@@ -671,7 +689,7 @@ def draw_resource_usage(report, cluster):
             if dev_stat is None:
                 continue
 
-            dev = os.path.basename(dev_stat['root_dev'])
+            dev = os.path.basename(dev_stat.root_dev)
             if dev not in perf_m['io']:
                 continue
 
@@ -802,22 +820,22 @@ def_color_map = [
 def val_to_color(val, color_map=def_color_map):
     idx = [i[0] for i in color_map]
     assert idx == sorted(idx)
-
     pos = bisect.bisect_left(idx, val)
-
     if pos <= 0:
-        return color_map[0][1]
+        ncolor = color_map[0][1]
+    elif pos >= len(idx):
+        ncolor = color_map[-1][1]
+    else:
+        color1 = color_map[pos - 1][1]
+        color2 = color_map[pos][1]
 
-    if pos > len(idx):
-        return color_map[-1][1]
+        dx1 = (val - idx[pos - 1]) / (idx[pos] - idx[pos - 1])
+        dx2 = (idx[pos] - val) / (idx[pos] - idx[pos - 1])
 
-    color1 = color_map[pos - 1][1]
-    color2 = color_map[pos][1]
+        ncolor = [(v1 * dx2 + v2 * dx1) * 255
+                  for v1, v2 in zip(color1, color2)]
 
-    dx1 = (val - idx[pos - 1]) / (idx[pos] - idx[pos - 1])
-    dx2 = (idx[pos] - val) / (idx[pos] - idx[pos - 1])
-
-    ncolor = [(v1 * dx2 + v2 * dx1 + 1) / 2 * 255 for v1, v2 in zip(color1, color2)]
+    ncolor = [(channel + 255) / 2 for channel in ncolor]
     return "#%02X%02X%02X" % tuple(map(int, ncolor))
 
 
