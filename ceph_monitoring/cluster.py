@@ -1,4 +1,5 @@
 import re
+import os.path
 import datetime
 import functools
 import collections
@@ -15,7 +16,7 @@ class CephOSD(object):
         self.daemon_runs = None
         self.pg_count = None
         self.config = None
-
+        self.pgs = {}
         self.data_stor_stats = None
         self.j_stor_stats = None
 
@@ -34,12 +35,16 @@ class Pool(object):
         self.name = None
 
 
-class HostNetworkInfo(object):
-    def __init__(self, adapter, ip):
-        self.adapter = adapter
+class NetworkAdapter(object):
+    def __init__(self, name, ip):
+        self.name = name
         self.ip = ip
+        self.is_phy = None
+        self.speed = None
+        self.duplex = None
         self.perf_stats = None
         self.perf_delta = None
+        self.perf_stats_curr = None
 
 
 class Disk(object):
@@ -102,6 +107,7 @@ def parse_netdev(netdev):
     info = {}
     for line in netdev.strip().split("\n")[2:]:
         adapter, data = line.split(":")
+        adapter = adapter.strip()
         assert adapter not in info
         info[adapter] = NetStats(*map(int, data.split()))
 
@@ -113,7 +119,7 @@ def parse_diskstats(diskstats):
     for line in diskstats.strip().split("\n"):
         data = line.split()
         data_i = map(int, data[:2]) + [data[2]] + map(int, data[3:])
-        info[data[2]] = DiskStats(*data_i)
+        info[data[2].strip()] = DiskStats(*data_i)
     return info
 
 
@@ -199,6 +205,9 @@ class CephCluster(object):
             host.rusage_stats = self.get_rusage_stats(host.name)
             host.perf_monitoring = self.get_perf_monitoring(host.name)
 
+        self.fill_io_devices_usage_stats()
+        self.fill_net_devices_usage_stats()
+
         data = self.storage.get('master/collected_at')
         assert data is not None
         self.report_collected_at_local, \
@@ -221,8 +230,91 @@ class CephCluster(object):
             if osd.status == 'up':
                 self.settings.__dict__.update(osd.config)
                 break
+        else:
+            self.settings = None
 
         self.pgmap_stat = mstorage.status['pgmap']
+
+    def fill_net_devices_usage_stats(self):
+        for host in self.hosts.values():
+
+            perf_m = host.perf_monitoring
+            if perf_m is not None:
+                perf_m = perf_m.get('net')
+
+            nets = [host.cluster_net, host.public_net] + \
+                [adapter for adapter in host.net_adapters.values()
+                 if adapter.is_phy]
+
+            for net in nets:
+                if net is None:
+                    continue
+
+                if perf_m is not None and net.name in perf_m:
+                    sd = perf_m[net.name].values[0]
+                    ed = perf_m[net.name].values[-1]
+                    dtime = len(perf_m[net.name].values) - 1
+                elif host.rusage_stats is not None and 'net' in host.rusage_stats:
+                    start_time, start_data = host.rusage_stats['net'][0]
+                    end_time, end_data = host.rusage_stats['net'][-1]
+                    dtime = end_time - start_time
+                    sd = start_data[net.name]
+                    ed = end_data[net.name]
+                else:
+                    continue
+
+                net.perf_stats_curr = TabulaRasa()
+                net.perf_stats_curr.sbytes = (ed.sbytes - sd.sbytes) / dtime
+                net.perf_stats_curr.rbytes = (ed.rbytes - sd.rbytes) / dtime
+                net.perf_stats_curr.spackets = (ed.spackets - sd.spackets) / dtime
+                net.perf_stats_curr.rpackets = (ed.rpackets - sd.rpackets) / dtime
+
+    def fill_io_devices_usage_stats(self):
+        for osd in self.osds:
+            host = self.hosts[osd.host]
+
+            perf_m = host.perf_monitoring
+            if perf_m is not None:
+                perf_m = perf_m.get('io')
+
+            if 'disk' in host.rusage_stats:
+                start_time, start_data = host.rusage_stats['disk'][0]
+                end_time, end_data = host.rusage_stats['disk'][-1]
+                rusage_dtime = end_time - start_time
+            else:
+                dtime = end_data = start_data = None
+
+            for dev_stat in (osd.data_stor_stats, osd.j_stor_stats):
+                if dev_stat is None:
+                    continue
+
+                dev = os.path.basename(dev_stat['root_dev'])
+
+                if perf_m is not None:
+                    sd = perf_m[dev].values[0]
+                    ed = perf_m[dev].values[-1]
+                    dtime = len(perf_m[dev].values) - 1
+                elif start_data is not None and dev in start_data:
+                    dtime = rusage_dtime
+                    sd = start_data[dev]
+                    ed = end_data[dev]
+                else:
+                    continue
+
+                dev_stat['read_bytes_curr'] = (ed.sectors_read - sd.sectors_read) * 512 / dtime
+                dev_stat['write_bytes_curr'] = (ed.sectors_written - sd.sectors_written) * 512 / dtime
+                dev_stat['read_iops_curr'] = (ed.reads_completed - sd.reads_completed) / dtime
+                dev_stat['write_iops_curr'] = (ed.writes_completed - sd.writes_completed) / dtime
+                dev_stat['io_time_curr'] = 0.001 * (ed.io_time - sd.io_time) / dtime
+                dev_stat['w_io_time_curr'] = 0.001 * (ed.weighted_io_time - sd.weighted_io_time) / dtime
+
+                if sd is not None:
+                    dev_stat['read_bytes_uptime'] = (sd.sectors_read) * 512 / host.uptime
+                    dev_stat['write_bytes_uptime'] = (sd.sectors_written) * 512 / host.uptime
+                    dev_stat['read_iops_uptime'] = sd.reads_completed / host.uptime
+                    dev_stat['write_iops_uptime'] = (sd.writes_completed) / host.uptime
+                    dev_stat['io_time_uptime'] = 0.001 * sd.io_time / host.uptime
+                    dev_stat['w_io_time_uptime'] = 0.001 * sd.weighted_io_time / host.uptime
 
     def load_cluster_networks(self):
         self.cluster_net = None
@@ -303,6 +395,8 @@ class CephCluster(object):
                 else:
                     osd.daemon_runs = False
 
+            data = self.storage.get('osd/{0}/osd_daemons'.format(osd.id))
+
             if self.sum_per_osd is not None:
                 osd.pg_count = self.sum_per_osd[osd.id]
             else:
@@ -353,25 +447,36 @@ class CephCluster(object):
         try:
             pg_dump = self.jstorage.master.pg_dump
         except AttributeError:
-            self.osd_pool_pg_2d = None
-            self.sum_per_pool = None
-            self.sum_per_osd = None
-            return
-
-        pool_id2name = dict((dt['poolnum'], dt['poolname'])
-                            for dt in self.jstorage.master.osd_lspools)
+            pg_dump = None
 
         self.osd_pool_pg_2d = collections.defaultdict(lambda: collections.Counter())
         self.sum_per_pool = collections.Counter()
         self.sum_per_osd = collections.Counter()
+        pool_id2name = dict((dt['poolnum'], dt['poolname'])
+                            for dt in self.jstorage.master.osd_lspools)
 
-        for pg in pg_dump['pg_stats']:
-            pool = int(pg['pgid'].split('.', 1)[0])
-            for osd_num in pg['acting']:
-                pool_name = pool_id2name[pool]
-                self.osd_pool_pg_2d[osd_num][pool_name] += 1
-                self.sum_per_pool[pool_name] += 1
-                self.sum_per_osd[osd_num] += 1
+        if pg_dump is None:
+            pg_re = re.compile(r"(?P<pool_id>[0-9a-f]+)\.(?P<pg_id>[0-9a-f]+)_head$")
+            for node in self.osd_tree.values():
+                if node['type'] == 'osd':
+                    osd_num = node['id']
+                    storage_ls = self.storage.get('osd/{0}/storage_ls'.format(osd_num))
+                    for pg in storage_ls.split():
+                        mobj = pg_re.match(pg)
+                        if mobj is None:
+                            continue
+                        pool_name = pool_id2name[int(mobj.group('pool_id'), 16)]
+                        self.osd_pool_pg_2d[osd_num][pool_name] += 1
+                        self.sum_per_pool[pool_name] += 1
+                        self.sum_per_osd[osd_num] += 1
+        else:
+            for pg in pg_dump['pg_stats']:
+                pool = int(pg['pgid'].split('.', 1)[0])
+                for osd_num in pg['acting']:
+                    pool_name = pool_id2name[pool]
+                    self.osd_pool_pg_2d[osd_num][pool_name] += 1
+                    self.sum_per_pool[pool_name] += 1
+                    self.sum_per_osd[osd_num] += 1
 
     def parse_meminfo(self, meminfo):
         info = {}
@@ -391,13 +496,10 @@ class CephCluster(object):
         return info
 
     def load_hosts(self):
-        for json_host in self.osd_tree.values():
-            if json_host["type"] != "host":
-                continue
+        for host_name in self.storage.hosts[2]:
+            stor_node = self.storage.get("hosts/" + host_name, expected_format=None)
 
-            stor_node = self.storage.get("hosts/" + json_host['name'], expected_format=None)
-
-            host = Host(json_host['name'])
+            host = Host(host_name)
             self.hosts[host.name] = host
 
             lshw_xml = stor_node.get('lshw', expected_format='xml')
@@ -429,15 +531,26 @@ class CephCluster(object):
             for adapter, ips_with_sizes in info.items():
                 for ip, sz in ips_with_sizes:
                     if self.public_net is not None and ip in self.public_net:
-                        host.public_net = HostNetworkInfo(adapter, ip)
+                        host.public_net = NetworkAdapter(adapter, ip)
 
                     if self.cluster_net is not None and ip in self.cluster_net:
-                        host.cluster_net = HostNetworkInfo(adapter, ip)
+                        host.cluster_net = NetworkAdapter(adapter, ip)
+
+            interfaces = getattr(self.jstorage.hosts, host_name).interfaces
+            for name, adapter_dct in interfaces.items():
+                adapter_dct = adapter_dct.copy()
+
+                dev = adapter_dct.pop('dev')
+                adapter = NetworkAdapter(dev, None)
+                adapter.__dict__.update(adapter_dct)
+                host.net_adapters[dev] = adapter
 
             net_stats = self.get_node_net_stats(host.name)
-            for net in (host.cluster_net, host.public_net):
-                if net is not None and net.adapter is not None:
-                    net.perf_stats = net_stats.get(net.adapter)
+            perf_adapters = [host.cluster_net, host.public_net] + list(host.net_adapters.values())
+
+            for net in perf_adapters:
+                if net is not None and net.name is not None:
+                    net.perf_stats = net_stats.get(net.name)
 
             host.uptime = float(stor_node.get('uptime').split()[0])
 

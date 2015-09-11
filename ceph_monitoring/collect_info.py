@@ -41,7 +41,11 @@ def check_output(cmd, log=True):
                          stderr=subprocess.PIPE)
     out = p.communicate()
     code = p.wait()
-    return code == 0, out[0]
+
+    if 0 == code:
+        return True, out[0]
+    else:
+        return True, out[0] + out[1]
 
 
 SSH_OPTS = "-o LogLevel=quiet -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
@@ -112,6 +116,26 @@ class Collector(object):
     # where XXX - node role role
     # def collect_XXX(self, path, node, **params):
     #    pass
+
+    # util functions, used in different classes
+    def get_host_interfaces(self, host):
+        ok, net_devs = check_output_ssh(host, self.opts, 'ls -l /sys/class/net')
+        if not ok:
+            logger.warning("'ls -l /sys/class/net' failed %s", net_devs)
+            return
+
+        for line in net_devs.strip().split("\n")[1:]:
+            if not line.startswith('l'):
+                continue
+
+            params = line.split()
+
+            if len(params) < 11:
+                logger.warning("Strange line in 'ls -l /sys/class/net' node %s: %r",
+                               host, line)
+                continue
+
+            yield ('devices/pci' in params[10]), params[8]
 
 
 class CephDataCollector(Collector):
@@ -247,6 +271,8 @@ class CephDataCollector(Collector):
         if jdev is None:
             jdev = "/var/lib/ceph/osd/ceph-{0}/journal".format(osd_id)
 
+        self.ssh2emit(host, path + "storage_ls", 'txt',
+                      "ls -1 " + os.path.join(data_dev, 'current'))
         data_root_dev = self.emit_device_info(host, path + "data", data_dev)
         jroot_dev = self.emit_device_info(host, path + "journal", jdev)
 
@@ -298,6 +324,52 @@ class NodeCollector(Collector):
         path = 'hosts/' + host + '/'
         for path_off, frmt, cmd in self.node_commands:
             self.ssh2emit(host, path + path_off, frmt, cmd)
+        self.collect_interfaces_info(path, host)
+
+    def collect_interfaces_info(self, path, host):
+        interfaces = {}
+        for is_phy, dev in self.get_host_interfaces(host):
+            interface = {'dev': dev, 'is_phy': is_phy}
+            interfaces[dev] = interface
+
+            if not is_phy:
+                continue
+
+            speed = None
+            ok, data = check_output_ssh(host, self.opts, "ethtool " + dev)
+            if ok:
+                for line in data.split("\n"):
+                    if 'Speed:' in line:
+                        speed = line.split(":")[1].strip()
+                    if 'Duplex:' in line:
+                        interface['duplex'] = line.split(":")[1].strip() == 'Full'
+
+            ok, data = check_output_ssh(host, self.opts, "iwconfig " + dev)
+            if ok and 'Bit Rate=' in data:
+                br1 = data.split('Bit Rate=')[1]
+                if 'Tx-Power=' in br1:
+                    speed = br1.split('Tx-Power=')[0]
+
+            if speed is not None:
+                mults = {
+                    'Kb/s': 125,
+                    'Mb/s': 125000,
+                    'Gb/s': 125000000,
+                }
+                for name, mult in mults.items():
+                    if name in speed:
+                        speed = int(speed.replace(name, '')) * mult
+                        break
+                else:
+                    logger.warning("Node %s - can't transform %s interface speed %r to Bps",
+                                   host, dev, speed)
+
+                if isinstance(speed, int):
+                    interface['speed'] = speed
+                else:
+                    interface['speed_s'] = speed
+
+        self.emit(path + 'interfaces', 'json', True, json.dumps(interfaces))
 
 
 class NodeResourseUsageCollector(Collector):
@@ -371,17 +443,12 @@ class CephPerformanceCollector(Collector):
             if 'ceph-osd' in vals[10]:
                 osd_pid_list.append(vals[1])
 
-        ok, net_devs = check_output_ssh(host, self.opts, 'ls -l /sys/class/net')
-        assert ok
-
         all_devs = []
         phy_devs = []
 
-        for line in net_devs.strip().split("\n")[1:]:
-            dev = line.split()[8]
+        for is_phy, dev in self.get_host_interfaces(host):
             all_devs.append(dev)
-
-            if 'devices/pci' in line.split()[10]:
+            if is_phy:
                 phy_devs.append(dev)
 
         all_devs_re = "|".join(map("\\b{0}\\b".format, all_devs))
@@ -469,7 +536,10 @@ def save_results_th_func(opts, res_q, out_folder):
                 open(fname, "wb").write(out)
             elif frmt == 'json':
                 if not opts.no_pretty_json:
-                    out = json.dumps(json.loads(out), indent=4, sort_keys=True)
+                    try:
+                        out = json.dumps(json.loads(out), indent=4, sort_keys=True)
+                    except:
+                        pass
                 open(fname, "w").write(out)
             else:
                 open(fname, "w").write(out)

@@ -28,9 +28,15 @@ RSMAP = [('K', 1024),
          ('G', 1024 ** 3),
          ('T', 1024 ** 4)]
 
+RSMAP2 = [('K', 1000),
+          ('M', 1000 ** 2),
+          ('G', 1000 ** 3),
+          ('T', 1000 ** 4)]
 
-def b2ssize(size, add_i=True):
-    if size < 1024:
+
+def b2ssize(size, add_i=True, base=1024):
+    assert base in (1024, 1000)
+    if size < base:
         if size == 0:
             return "0"
         elif size < 1:
@@ -40,9 +46,10 @@ def b2ssize(size, add_i=True):
         else:
             return str(size)
 
-    i = 'i' if add_i else ''
-    for name, scale in RSMAP:
-        if size < 1024 * scale:
+    i = 'i' if (add_i and base == 1024) else ''
+
+    for name, scale in (RSMAP if base == 1024 else RSMAP2):
+        if size < base * scale:
             if size % scale == 0:
                 val = size // scale
                 return "{0} {1}{2}".format(val, name, i)

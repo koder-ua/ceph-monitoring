@@ -85,6 +85,8 @@ header {
 
 .horizon .title {
   left: 0;
+  color: rgb(200,50,50);
+  font-weight: bold;
 }
 
 .horizon .value {
