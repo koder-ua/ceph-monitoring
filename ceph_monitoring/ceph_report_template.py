@@ -100,10 +100,9 @@ header {
 """
 
 scripts = [
-  'http://d3js.org/d3.v2.js?2.9.1',
-  'http://square.github.com/cubism/cubism.v1.js?1.0.0'
+  'http://d3js.org/d3.v2.js',
+  'http://square.github.com/cubism/cubism.v1.js'
 ]
-
 
 # <body id="demo">
 
@@ -112,8 +111,8 @@ body_script = """
 var context = cubism.context()
     //.serverDelay(new Date(2012, 4, 2) - Date.now())
     //.step(864e5)
-    .step(1)
-    .size(3600)
+    .step(2)
+    .size(200)
     .stop();
 
 d3.select("#__id__").selectAll(".axis")

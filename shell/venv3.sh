@@ -1,7 +1,8 @@
 #!/bin/bash
-set -x
+#set -x
 set -e
 set -o pipefail
+REP_STORAGE=/var/ceph_reports
 
 # venv 3.3
 # FUEL_IP=172.16.52.119
@@ -39,6 +40,12 @@ rm $log_file
 echo "Copying results back"
 ssh root@$FUEL_IP scp $NODE_IP:$file /tmp >/dev/null
 bfile=$(basename $file)
-scp root@$FUEL_IP:/tmp/$bfile /tmp/$bfile >/dev/null
+scp root@$FUEL_IP:/tmp/$bfile $REP_STORAGE/$bfile >/dev/null
 
-echo "Results stored into /tmp/$bfile"
+echo "Archive stored in $REP_STORAGE/$bfile"
+
+dirname="${bfile#file}"
+dirname="${dirname/.tar.gz/}"
+mkdir "$REP_STORAGE/$dirname"
+tar -zxvf "$REP_STORAGE/$bfile" -C "$REP_STORAGE/$dirname" >/dev/null 2>&1
+echo "Unpacked data stored into $REP_STORAGE/$dirname"
