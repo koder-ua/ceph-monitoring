@@ -1,19 +1,28 @@
 
 class RTag(object):
     def __getattr__(self, name):
-        def closure(text, **attrs):
+        def closure(text="", **attrs):
+            name2 = name.replace("_", '-')
+
             if '_class' in attrs:
                 attrs['class'] = attrs.pop('_class')
 
             if len(attrs) == 0:
                 sattrs = ""
             else:
-                sattrs = " " + " ".join('{0}="{1}"'.format(name, val) for name, val in attrs.items())
+                sattrs = " " + " ".join('{0}="{1}"'.format(name2, val) for name2, val in attrs.items())
 
-            if text == "" and name not in ('script', 'link'):
-                return "<{0}{1} />".format(name, sattrs)
+            if name2 == 'br':
+                assert text == ""
+                assert attrs == {}
+                return "<br>"
+            elif text == "" and name2 not in ('script', 'link'):
+                return "<{0}{1} />".format(name2, sattrs)
+            elif name2 == 'link':
+                assert text == ''
+                return "<{0}{1}>".format(name2, sattrs)
             else:
-                return "<{0}{1}>{2}</{0}>".format(name, sattrs, text)
+                return "<{0}{1}>{2}</{0}>".format(name2, sattrs, text)
         return closure
 
 
@@ -34,7 +43,7 @@ class TagProxy(object):
         self.__attrs = {}
         self.__childs = []
 
-    def __call__(self, text, **attrs):
+    def __call__(self, text="", **attrs):
         self.__childs.append(text)
         self.__attrs.update(attrs)
         return self
@@ -69,6 +78,13 @@ class Doc(object):
             tagp = getattr(self.__stack[-1], name)
         return tagp
 
+    def _enter(self, name, text="", **attrs):
+        self += getattr(self, name)
+        self(text, **attrs)
+
+    def _exit(self):
+        self -= self.__stack[-1]
+
     def __str__(self):
         assert self.__stack == []
         return "".join(map(str, self.__childs))
@@ -81,20 +97,24 @@ class Doc(object):
         assert self.__stack.pop() is tag
         return self
 
-    def __call__(self, text, **attrs):
+    def __call__(self, text="", **attrs):
         assert self.__stack != []
         return self.__stack[-1](text, **attrs)
 
 
 class HTMLTable(object):
     def_table_attrs = {
-        'class': 'table table-bordered table-striped table-condensed sortable'
+        'class': 'table table-bordered table-condensed sortable'  # table-striped
     }
 
-    def __init__(self, headers, table_attrs=def_table_attrs):
-        self.table_attrs = table_attrs
+    def __init__(self, headers=None, table_attrs=def_table_attrs, zebra=True):
+        self.table_attrs = table_attrs.copy()
+
+        if zebra:
+            self.table_attrs['class'] += " zebra-table"
+
         self.headers = [(header, {}) for header in headers]
-        self.allign = ['center'] * len(self.headers)
+
         self.cells = [[]]
 
     def add_header(self, text, attrs=None):
@@ -102,6 +122,9 @@ class HTMLTable(object):
 
     def add_cell(self, data, **attrs):
         self.cells[-1].append((data, attrs))
+
+    def add_cells(self, *cells, **attrs):
+        self.add_row(cells, **attrs)
 
     def add_row(self, data, **attrs):
         for val in data:
@@ -121,6 +144,8 @@ class HTMLTable(object):
 
             with t.tbody:
                 for line in self.cells:
+                    if line == [] and line is self.cells[-1]:
+                        continue
                     with t.tr:
                         for cell, attrs in line:
                             t.td(cell, **attrs)
