@@ -6,6 +6,7 @@ import collections
 
 from ipaddr import IPNetwork, IPAddress
 from hw_info import get_hw_info, ssize2b
+from multiprocessing import Pool as MPExecutorPool
 
 
 class CephOSD(object):
@@ -297,8 +298,7 @@ class CephCluster(object):
                     continue
 
                 dev = os.path.basename(dev_stat.root_dev)
-
-                if perf_m is not None:
+                if perf_m is not None and dev in perf_m:
                     sd = perf_m[dev].values[0]
                     ed = perf_m[dev].values[-1]
                     dtime = len(perf_m[dev].values) - 1
@@ -319,7 +319,11 @@ class CephCluster(object):
                 # derived stats
                 dev_stat.iops_curr = dev_stat.read_iops_curr + dev_stat.write_iops_curr
                 dev_stat.queue_depth_curr = dev_stat.w_io_time_curr
-                dev_stat.lat_curr = dev_stat.w_io_time_curr / dev_stat.iops_curr
+
+                if dev_stat.iops_curr > 1E-5:
+                    dev_stat.lat_curr = dev_stat.w_io_time_curr / dev_stat.iops_curr
+                else:
+                    dev_stat.lat_curr = 0
 
                 dev_stat.read_bytes_uptime = (sd.sectors_read) * 512 / host.uptime
                 dev_stat.write_bytes_uptime = (sd.sectors_written) * 512 / host.uptime
@@ -477,7 +481,8 @@ class CephCluster(object):
                         mobj = pg_re.match(pg)
                         if mobj is None:
                             continue
-                        pool_name = pool_id2name[int(mobj.group('pool_id'), 16)]
+
+                        pool_name = pool_id2name[int(mobj.group('pool_id'))]
                         self.osd_pool_pg_2d[osd_num][pool_name] += 1
                         self.sum_per_pool[pool_name] += 1
                         self.sum_per_osd[osd_num] += 1
@@ -519,7 +524,10 @@ class CephCluster(object):
             if lshw_xml is None:
                 host.hw_info = None
             else:
-                host.hw_info = get_hw_info(lshw_xml)
+                try:
+                    host.hw_info = get_hw_info(lshw_xml)
+                except:
+                    host.hw_info = None
 
             info = self.parse_meminfo(stor_node.get('meminfo'))
             host.mem_total = info['MemTotal']
@@ -599,6 +607,13 @@ class CephCluster(object):
             stats_s = self.storage.get(path + name)
             if stats_s is not None:
                 res[name] = load_performance_log_file(stats_s, fields, skip)
+
+        # mp_pool = MPExecutorPool(processes=2)
+        # futures = {}
+        # futures[name] = mp_pool.apply_async(load_performance_log_file,
+        #                                     [stats_s, fields, skip])
+        # for name, future in futures.items():
+        #     res[name] = future.get()
 
         def to_seconds(val):
             if '-' in val:

@@ -6,6 +6,7 @@ import bisect
 import os.path
 import warnings
 import argparse
+import itertools
 import subprocess
 import collections
 
@@ -62,9 +63,23 @@ class Report(object):
         self.style_links.append("http://getbootstrap.com/examples/dashboard/dashboard.css")
 
         css = """
-        table.zebra-table tr:nth-child(even) {
-          background-color: #E0E0FF;
+        table.zebra-table tr:nth-child(even) {background-color: #E0E0FF;}
+        table th {background: #ededed;}
+        .right{
+            position:relative;
+            margin:0;
+            padding:0;
+            float:right;
         }
+        .left{
+            position:relative   ;
+            margin:0;
+            padding:0;
+            float:left;
+        }
+        th {text-align: center;}
+        td {text-align: right;}
+        tr td:first-child {text-align: left;}
         """
 
         self.style.append(css)
@@ -91,10 +106,7 @@ class Report(object):
                 for url in css_links:
                     doc.link(href=url, rel="stylesheet", type="text/css")
 
-                doc.style("\n".join(self.style) +
-                          "\nth {text-align: center;}" +
-                          "\ntd {text-align: right;}\n",
-                          type="text/css")
+                doc.style("\n".join(self.style), type="text/css")
 
                 for url in js_links:
                     doc.script(type="text/javascript", src=url)
@@ -127,10 +139,7 @@ class Report(object):
                                 elif w is None:
                                     doc(block)
                                 else:
-                                    # wl = (12 - w) / 2
-                                    # offset_class = " col-md-offset-" + str(wl)
-                                    offset_class = ""
-                                    with doc.div(_class="col-md-" + str(w) + offset_class):
+                                    with doc.div(_class="col-md-" + str(w)):
                                         doc.H3.center(header, id="section" + str(sid))
                                         doc.br
 
@@ -252,7 +261,7 @@ def show_osd_state(report, cluster):
     table = html2.HTMLTable(headers=["Status", "Count", "ID's"])
     for status, osds in sorted(statuses.items()):
         table.add_row([status, len(osds),
-                       "" if status == "up" else ",".join(osds)])
+                       "" if status == "up" else "<br>".join(osds)])
     report.add_block(2, "OSD's state:", table)
 
 
@@ -582,11 +591,12 @@ def show_host_network_load_in_color(report, cluster):
                     color = val_to_color(float(usage) / speed)
 
                 if net_name not in std_nets:
-                    text = "{0}: {1}".format(net_name, b2ssize(usage, False))
+                    text = H.div(net_name, _class="left") + \
+                           H.div(b2ssize(usage, False), _class="right")
                 else:
                     text = b2ssize(usage, False)
 
-                table.add_cell(H.font(text, color="#303030"),
+                table.add_cell(text,
                                bgcolor=color,
                                sorttable_customkey=str(usage))
 
@@ -631,7 +641,7 @@ def show_host_io_load_in_color(report, cluster):
 
             queue_depth[osd.host][dev] = dev_stat.w_io_time_curr
             lat[osd.host][dev] = dev_stat.lat_curr * 1000
-            io_time[osd.host][dev] = dev_stat.io_time_curr
+            io_time[osd.host][dev] = int(dev_stat.io_time_curr * 100)
             w_io_time[osd.host][dev] = dev_stat.w_io_time_curr
 
     if len(wbts) == 0:
@@ -640,21 +650,20 @@ def show_host_io_load_in_color(report, cluster):
 
     loads = [
         (iops, 1000, 'IOPS', 50),
-        (bts, 1024, 'Bps', 200 * 1024),  # 50 IOPS * 4k
-
         (riops, 1000, 'Read IOPS', 30),
         (wiops, 1000, 'Write IOPS', 30),
 
-        (rbts, 1024, 'Read Bps', 120 * 1024),  # 30 IOPS * 4k
-        (wbts, 1024, 'Write Bps', 120 * 1024),  # 30 IOPS * 4k
+        (bts, 1024, 'Bps', 100 * 1024 ** 2),
+        (rbts, 1024, 'Read Bps', 100 * 1024 ** 2),
+        (wbts, 1024, 'Write Bps', 100 * 1024 ** 2),
 
-        (queue_depth, None, 'QD', 3),
         (lat, None, 'Latency, ms', 20),
-        (io_time, None, 'Time share', 1.0),
-        (w_io_time, None, 'W. time share', 5.0),
+        (queue_depth, None, 'Average QD', 3),
+        (io_time, None, 'Active time %', 100),
+        # (w_io_time, None, 'W. time share', 5.0),
     ]
 
-    report.add_block(12, "Disk IO load", "")
+    report.add_block(12, "Current disk IO load", "")
     for pos, (target, base, tp, min_max_val) in enumerate(loads, 1):
         if target is lat:
             max_val = 300.0
@@ -682,7 +691,7 @@ def show_host_io_load_in_color(report, cluster):
                 else:
                     s_val = b2ssize(val, False, base=base)
 
-                cell_data = H.font('{0} {1}'.format(dev, s_val), color="#303030")
+                cell_data = H.div(dev, _class="left") + H.div(s_val, _class="right")
                 table.add_cell(cell_data,
                                bgcolor=color,
                                sorttable_customkey=str(val))
@@ -713,10 +722,14 @@ def show_hosts_info(report, cluster):
             services.append("mon(" + host.name + ")")
 
         table.add_cell(host.name)
-        table.add_cell("<br>".join(services))
+        srv_strs = []
+        for idx in range(len(services) / 3):
+            srv_strs.append(",".join(services[idx * 3: idx * 3 + 3]))
+        table.add_cell("<br>".join(srv_strs))
 
         if host.hw_info is None:
-            table.add_cell(['-'] * (len(header_row) - 2))
+            map(table.add_cell, ['-'] * (len(header_row) - 2))
+            table.next_row()
             continue
 
         if host.hw_info.cores == []:
@@ -737,7 +750,7 @@ def show_hosts_info(report, cluster):
     report.add_block(6, "Host's info:", table)
 
 
-def show_hosts_perf_stats(report, cluster):
+def show_hosts_resource_usage(report, cluster):
     nets_info = {}
 
     for host in cluster.hosts.values():
@@ -756,11 +769,11 @@ def show_hosts_perf_stats(report, cluster):
 
     header_row = ["Hostname",
                   "Cluster net<br>dev, ip<br>settings",
-                  "Cluster net<br>uptime average<br>send/recv Bps<br>send/recv pps",
-                  "Cluster net<br>current<br>send/recv Bps<br>send/recv pps",
+                  "Cluster net<br>uptime average<br>send/recv",
+                  "Cluster net<br>current<br>send/recv",
                   "Public net<br>dev, ip<br>settings",
-                  "Public net<br>uptime average<br>send/recv Bps<br>send/recv pps",
-                  "Public net<br>current<br>send/recv Bps<br>send/recv pps"]
+                  "Public net<br>uptime average<br>send/recv",
+                  "Public net<br>current<br>send/recv"]
 
     header_row += ["Net"] * max_nets
     row_len = len(header_row)
@@ -776,14 +789,13 @@ def show_hosts_perf_stats(report, cluster):
                 dev_ip = "{0}<br>{1}".format(net.name, net.ip)
 
                 if host.hw_info is None or net.name not in host.hw_info.net_info:
-                    settings = "-"
+                    perf_info.append(dev_ip)
                 else:
                     speed, dtype, _ = host.hw_info.net_info[net.name]
                     settings = "{0}, {1}".format(speed, dtype)
+                    perf_info.append("{0}<br>{1}".format(dev_ip, settings))
 
-                perf_info.append("{0}<br>{1}".format(dev_ip, settings))
-
-                perf_info.append("{0} / {1}<br>{2} / {3}".format(
+                perf_info.append("{0} / {1} Bps<br>{2} / {3} Pps".format(
                     b2ssize(float(net.perf_stats.sbytes) / host.uptime, False),
                     b2ssize(float(net.perf_stats.rbytes) / host.uptime, False),
                     b2ssize(float(net.perf_stats.spackets) / host.uptime, False),
@@ -791,7 +803,7 @@ def show_hosts_perf_stats(report, cluster):
                 ))
 
                 if net.perf_stats_curr is not None:
-                    perf_info.append("{0} / {1}<br>{2} / {3}".format(
+                    perf_info.append("{0} / {1} Bps<br>{2} / {3} Pps".format(
                         b2ssize(net.perf_stats_curr.sbytes, False),
                         b2ssize(net.perf_stats_curr.rbytes, False),
                         b2ssize(net.perf_stats_curr.spackets, False),
@@ -802,7 +814,9 @@ def show_hosts_perf_stats(report, cluster):
 
         for net in nets_info[host.name]:
             if net.speed is not None:
-                perf_info.append(net.name + ": " + b2ssize(net.speed))
+                cell_data = H.div(net.name, _class="left") + \
+                            H.div(b2ssize(net.speed), _class="right")
+                perf_info.append(cell_data)
             else:
                 perf_info.append(net.name)
         perf_info += ['-'] * (row_len - len(perf_info))
@@ -968,7 +982,7 @@ def draw_resource_usage_rsw(report, cluster):
 
 def show_osd_pool_PG_distribution(report, cluster):
     if cluster.sum_per_osd is None:
-        report.add_block(6, "PG per OSD: No pg dump data. Probably too many PG", "")
+        report.add_block(6, "PG copy per OSD: No pg dump data. Probably too many PG", "")
         return
 
     pools = sorted(cluster.sum_per_pool)
@@ -987,7 +1001,7 @@ def show_osd_pool_PG_distribution(report, cluster):
     map(table.add_cell, (cluster.sum_per_pool[pool_name] for pool_name in pools))
     table.add_cell(str(sum(cluster.sum_per_pool.values())))
 
-    report.add_block(12, "PG per OSD:", table)
+    report.add_block(8, "PG copy per OSD:", table)
 
 
 visjs_script = """
@@ -1128,6 +1142,12 @@ def parse_args(argv):
     p.add_argument("-w", '--overwrite', action='store_true', default=False,
                    help="Overwrite result folder data")
     p.add_argument("-n", "--name", help="Report name", default="Nemo")
+    p.add_argument("-s", "--simple", help="Generate simple report", default=False,
+                   action="store_true")
+    p.add_argument("-g", "--no-graph", help="Don't draw OSD graphs", default=False,
+                   action="store_true")
+    p.add_argument("--profile", help="Don't draw OSD graphs", default=False,
+                   action="store_true")
     p.add_argument("data_folder", help="Folder with data, or .tar.gz archive")
     return p.parse_args(argv[1:])
 
@@ -1168,10 +1188,13 @@ def main(argv):
 
         report = Report(opts.name, "index.html")
         report.style.append('body {font: 10pt sans;}')
-        # report.style.append("table.colored tbody tr:nth-child(2n) td {background: #ccccff;}")
-        # report.style.append("table.colored tbody tr:nth-child(2n+1) td {background: #ffcccc;}")
         report.style_links.append("https://maxcdn.bootstrapcdn.com/bootstrap/3.3.4/css/bootstrap.min.css")
-        report.script_links.append("http://www.kryogenix.org/code/browser/sorttable/sorttable.js")
+
+        if opts.simple:
+            dct = html2.HTMLTable.def_table_attrs
+            dct['class'] = dct['class'].replace("sortable", "").replace("zebra-table", "")
+        else:
+            report.script_links.append("http://www.kryogenix.org/code/browser/sorttable/sorttable.js")
 
         show_summary(report, cluster)
         report.next_line()
@@ -1200,24 +1223,42 @@ def main(argv):
         show_host_network_load_in_color(report, cluster)
         report.next_line()
 
-        show_hosts_perf_stats(report, cluster)
+        show_hosts_resource_usage(report, cluster)
         report.next_line()
 
-        tree_to_visjs(report, cluster)
+        if not opts.no_graph:
+            tree_to_visjs(report, cluster)
+
         report.save_to(opts.out)
         print "Report successfully stored in", index_path
 
-        # draw_resource_usage(report, cluster)
-
-        perf_path = os.path.join(opts.out, "performance.html")
-        load_report = Report(opts.name, "performance.html")
-        draw_resource_usage_rsw(load_report, cluster)
-        load_report.save_to(opts.out)
-        print "Peformance report successfully stored in", perf_path
+        # perf_path = os.path.join(opts.out, "performance.html")
+        # load_report = Report(opts.name, "performance.html")
+        # # draw_resource_usage(load_report, cluster)
+        # draw_resource_usage_rsw(load_report, cluster)
+        # load_report.save_to(opts.out)
+        # print "Peformance report successfully stored in", perf_path
     finally:
         if remove_folder:
             shutil.rmtree(folder)
 
 
 if __name__ == "__main__":
-    exit(main(sys.argv))
+    if '--profile' in sys.argv:
+        import hotshot
+        import hotshot.stats
+        prof = hotshot.Profile("/tmp/cl_2.prof")
+        prof.start()
+
+    res = main(sys.argv)
+
+    if '--profile' in sys.argv:
+        prof.stop()
+        prof.close()
+
+        stats = hotshot.stats.load("/tmp/cl_2.prof")
+        stats.strip_dirs()
+        stats.sort_stats('time', 'calls')
+        stats.print_stats(40)
+
+    exit(res)

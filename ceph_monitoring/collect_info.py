@@ -48,8 +48,9 @@ def check_output(cmd, log=True):
         return True, out[0] + out[1]
 
 
-SSH_OPTS = "-o LogLevel=quiet -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
-
+SSH_OPTS = "-o LogLevel=quiet -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
+SSH_OPTS += "-o ConnectTimeout=20"
+# add timeouts
 
 def check_output_ssh(host, opts, cmd):
     logger.debug("SSH:%s: %r", host, cmd)
@@ -165,7 +166,7 @@ class CephDataCollector(Collector):
         assert ok
 
         cmds = ['osd tree', 'df', 'auth list', 'osd dump',
-                'health', 'health detail', 'mon_status', 'osd lspools',
+                'health', 'mon_status', 'osd lspools',
                 'osd perf']
 
         if json.loads(status)['pgmap']['num_pgs'] > self.opts.max_pg_dump_count:
@@ -185,16 +186,23 @@ class CephDataCollector(Collector):
         self.run2emit(path + "rados_df", 'json',
                       "rados df -c {0.conf} -k {0.key} --format json".format(self.opts))
 
+        ok, out = check_output(self.ceph_cmd + 'health detail')
+        if not ok:
+            self.emit(path + 'health_detail', 'err', ok, out)
+        else:
+            self.emit(path + 'health_detail', 'json', ok, out)
+
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             out_file = os.tempnam()
-            ok, out = check_output(self.ceph_cmd + "osd getcrushmap -o " + out_file)
-            if not ok:
-                self.emit(path + 'crushmap', 'err', ok, out)
-            else:
-                data = open(out_file, "rb").read()
-                os.unlink(out_file)
-                self.emit(path + 'crushmap', 'bin', ok, data)
+
+        ok, out = check_output(self.ceph_cmd + "osd getcrushmap -o " + out_file)
+        if not ok:
+            self.emit(path + 'crushmap', 'err', ok, out)
+        else:
+            data = open(out_file, "rb").read()
+            os.unlink(out_file)
+            self.emit(path + 'crushmap', 'bin', ok, data)
 
     def emit_device_info(self, host, path, device_file):
         ok, dev_str = check_output_ssh(host, self.opts, "df " + device_file)
@@ -318,6 +326,8 @@ class NodeCollector(Collector):
         ("netdev",    "txt", "cat /proc/net/dev"),
         ("ceph_conf", "txt", "cat /etc/ceph/ceph.conf"),
         ("uptime",    "txt", "cat /proc/uptime"),
+        ("dmesg",     "txt", "cat /var/log/dmesg")
+        ("netstat",   "txt", "netstat -nap")
     ]
 
     def collect_node(self, path, host):
@@ -674,14 +684,53 @@ def parse_args(argv):
 logger_ready = False
 
 
-def get_sshable_hosts(hosts):
+def prun(runs, thcount):
+    res_q = Queue.Queue()
+    input_q = Queue.Queue()
+    map(input_q.put, enumerate(runs))
+
+    def worker():
+        while True:
+            try:
+                pos, (func, args, kwargs) = input_q.get(False)
+            except Queue.Empty:
+                return
+
+            try:
+                res_q.append((pos, True, func(*args, **kwargs)))
+            except Exception as exc:
+                res_q.append((pos, False, exc))
+
+    ths = [threading.thread(target=worker) for i in range(thcount)]
+
+    for th in ths:
+        th.daemon = True
+        th.start()
+
+    for th in ths:
+        th.join()
+
+    results = []
+    while not res_q.empty():
+        results.append(res_q.get())
+
+    return [(ok, val) for _, ok, val in sorted(results)]
+
+
+def pmap(func, data, thcount):
+    return prun([(func, val, {}) for val in data], thcount)
+
+
+def get_sshable_hosts(hosts, thcount=32):
     cmd = "ssh " + SSH_OPTS + " -o ConnectTimeout=5 -o ConnectionAttempts=1 "
-    good_hosts = []
-    for host in hosts:
-        ok, out = check_output(cmd + host + ' pwd')
+
+    def check_host(host):
+        ok, _ = check_output(cmd + host + ' pwd')
         if ok:
-            good_hosts.append(host)
-    return good_hosts
+            return host
+
+    results = pmap(check_host, hosts)
+    return [res for res in results if res is not None]
 
 
 def main(argv):

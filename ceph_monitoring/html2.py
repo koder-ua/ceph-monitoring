@@ -26,13 +26,7 @@ class RTag(object):
         return closure
 
 
-class Tag(object):
-    def __getattr__(self, name):
-        raise AttributeError("Not implemented")
-
-
 rtag = RTag()
-tag = Tag()
 
 
 class TagProxy(object):
@@ -104,17 +98,21 @@ class Doc(object):
 
 class HTMLTable(object):
     def_table_attrs = {
-        'class': 'table table-bordered table-condensed sortable'  # table-striped
+        'class': 'table table-bordered table-condensed sortable zebra-table'
     }
 
-    def __init__(self, headers=None, table_attrs=def_table_attrs, zebra=True):
+    def __init__(self, headers=None,
+                 table_attrs=def_table_attrs,
+                 zebra=True, header_attrs=None):
         self.table_attrs = table_attrs.copy()
 
-        if zebra:
-            self.table_attrs['class'] += " zebra-table"
+        if not zebra:
+            self.table_attrs['class'].replace("zebra-table", "")
 
-        self.headers = [(header, {}) for header in headers]
+        if header_attrs is None:
+            header_attrs = {}
 
+        self.headers = [(header, header_attrs) for header in headers]
         self.cells = [[]]
 
     def add_header(self, text, attrs=None):

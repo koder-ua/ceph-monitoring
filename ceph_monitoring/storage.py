@@ -10,15 +10,14 @@ class RawResultStorage(object):
     def _load(self):
         if self._all is None:
             self._all = {}
-            for fname in os.listdir(self._root):
+            rt = os.path.abspath(self._root)
+            for fname in os.listdir(rt):
                 if fname.startswith('.'):
                     continue
 
-                full_path = os.path.abspath(os.path.join(self._root, fname))
+                full_path = os.path.join(rt, fname)
 
-                if os.path.isfile(full_path):
-                    if '.' not in fname:
-                        raise ValueError("File {0} has unknown type".format(full_path))
+                if '.' in fname:
                     fname_no_ext, ext = fname.rsplit('.', 1)
                     self._all[fname_no_ext] = (True, ext, full_path)
                 else:
@@ -28,6 +27,7 @@ class RawResultStorage(object):
 
     def __getattr__(self, name):
         self._load()
+
         path = os.path.join(self._root, name)
         if os.path.isdir(path):
             return True, None, self.__class__(path)
