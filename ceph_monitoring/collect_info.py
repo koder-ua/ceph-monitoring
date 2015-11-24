@@ -697,11 +697,11 @@ def prun(runs, thcount):
                 return
 
             try:
-                res_q.append((pos, True, func(*args, **kwargs)))
+                res_q.put((pos, True, func(*args, **kwargs)))
             except Exception as exc:
-                res_q.append((pos, False, exc))
+                res_q.put((pos, False, exc))
 
-    ths = [threading.thread(target=worker) for i in range(thcount)]
+    ths = [threading.Thread(target=worker) for i in range(thcount)]
 
     for th in ths:
         th.daemon = True
@@ -718,19 +718,19 @@ def prun(runs, thcount):
 
 
 def pmap(func, data, thcount):
-    return prun([(func, val, {}) for val in data], thcount)
+    return prun([(func, [val], {}) for val in data], thcount)
 
 
 def get_sshable_hosts(hosts, thcount=32):
     cmd = "ssh " + SSH_OPTS + " -o ConnectTimeout=5 -o ConnectionAttempts=1 "
 
     def check_host(host):
-        ok, _ = check_output(cmd + host + ' pwd')
+        ok, out = check_output(cmd + host + ' pwd')
         if ok:
             return host
 
-    results = pmap(check_host, hosts)
-    return [res for res in results if res is not None]
+    results = pmap(check_host, hosts, thcount=thcount)
+    return [res for ok, res in results if ok and res is not None]
 
 
 def main(argv):
