@@ -838,49 +838,52 @@ def main(argv):
     save_results_thread.start()
 
     t1 = time.time()
-    run_all(opts, run_q)
+    try:
+        run_all(opts, run_q)
 
-    # collect data at the end
-    if node_resource_collector is not None:
-        dt = opts.usage_collect_interval - (time.time() - t1)
-        if dt > 0:
-            logger.info("Will wait for {0} seconds for usage collection".format(int(dt)))
+        # collect data at the end
+        if node_resource_collector is not None:
+            dt = opts.usage_collect_interval - (time.time() - t1)
+            if dt > 0:
+                logger.info("Will wait for {0} seconds for usage collection".format(int(dt)))
+                for i in range(int(dt / 0.1)):
+                    time.sleep(0.1)
+            logger.info("Start final usage collection")
+            for node, _ in nodes['node'].items():
+                run_q.put((node_resource_collector.collect_node, "", node, {}))
+            run_all(opts, run_q)
+
+        if ceph_performance_collector is not None:
+            logger.info("Start performace monitoring.")
+            with ceph_collector.osd_devs_lock:
+                osd_devs = ceph_collector.osd_devs.copy()
+
+            per_node = collections.defaultdict(lambda: [])
+            for node, data_dev, j_dev in osd_devs.values():
+                per_node[node].extend((data_dev, j_dev))
+
+            # start monitoring
+            for node, data in per_node.items():
+                run_q.put((ceph_performance_collector.start_performance_monitoring,
+                          "", node, {'osd_devs': data}))
+            run_all(opts, run_q)
+
+            dt = opts.performance_collect_seconds
+            logger.info("Will wait for {0} seconds for performance collection".format(int(dt)))
             for i in range(int(dt / 0.1)):
                 time.sleep(0.1)
-        logger.info("Start final usage collection")
-        for node, _ in nodes['node'].items():
-            run_q.put((node_resource_collector.collect_node, "", node, {}))
-        run_all(opts, run_q)
 
-    if ceph_performance_collector is not None:
-        logger.info("Start performace monitoring.")
-        with ceph_collector.osd_devs_lock:
-            osd_devs = ceph_collector.osd_devs.copy()
-
-        per_node = collections.defaultdict(lambda: [])
-        for node, data_dev, j_dev in osd_devs.values():
-            per_node[node].extend((data_dev, j_dev))
-
-        # start monitoring
-        for node, data in per_node.items():
-            run_q.put((ceph_performance_collector.start_performance_monitoring,
-                      "", node, {'osd_devs': data}))
-        run_all(opts, run_q)
-
-        dt = opts.performance_collect_seconds
-        logger.info("Will wait for {0} seconds for performance collection".format(int(dt)))
-        for i in range(int(dt / 0.1)):
-            time.sleep(0.1)
-
-        # collect results
-        for node, data in per_node.items():
-            run_q.put((ceph_performance_collector.collect_performance_data,
-                      "", node, {}))
-        run_all(opts, run_q)
-
-    res_q.put(None)
-    # wait till all data collected
-    save_results_thread.join()
+            # collect results
+            for node, data in per_node.items():
+                run_q.put((ceph_performance_collector.collect_performance_data,
+                          "", node, {}))
+            run_all(opts, run_q)
+    finally:
+        res_q.put(None)
+        # wait till all data collected
+        save_results_thread.join()
+    except:
+        logger.exception("When collecting data:")
 
     if opts.result is None:
         with warnings.catch_warnings():
