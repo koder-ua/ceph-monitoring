@@ -878,12 +878,12 @@ def main(argv):
                 run_q.put((ceph_performance_collector.collect_performance_data,
                           "", node, {}))
             run_all(opts, run_q)
+    except:
+        logger.exception("When collecting data:")
     finally:
         res_q.put(None)
         # wait till all data collected
         save_results_thread.join()
-    except:
-        logger.exception("When collecting data:")
 
     if opts.result is None:
         with warnings.catch_warnings():
